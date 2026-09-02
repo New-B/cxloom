@@ -1,17 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage: ./scripts/stop-numa-containers.sh [container-count]
-CONTAINER_COUNT="${1:-4}"
+# Usage: ./scripts/stop-numa-containers.sh
+# Stop and remove all containers with names starting with 'cxloom-h'.
+# No arguments required.
 
-if ! [[ "${CONTAINER_COUNT}" =~ ^[1-4]$ ]]; then
-    echo "container-count must be an integer from 1 to 4" >&2
-    exit 1
+set +e
+names=$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E '^cxloom-h' || true)
+set -e
+
+if [[ -z "${names}" ]]; then
+    echo "No containers found with prefix 'cxloom-h'."
+    exit 0
 fi
 
-for ((host_id = 0; host_id < CONTAINER_COUNT; ++host_id)); do
-    container_name="cxloom-h${host_id}"
-    if docker container inspect "${container_name}" >/dev/null 2>&1; then
-        docker rm --force "${container_name}"
+while IFS= read -r container_name; do
+    if [[ -n "$container_name" ]]; then
+        echo "Removing ${container_name}"
+        docker rm --force "$container_name" || true
     fi
-done
+done <<< "${names}"
