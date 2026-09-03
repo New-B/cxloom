@@ -18,6 +18,13 @@ struct CxloomConfig {
     std::size_t coherence_granule_bytes {4096};
     std::size_t queue_capacity_entries {1024};
 
+    // Empty selects a process-private anonymous mapping for unit tests.
+    // A devdax path such as /dev/dax0.0 selects a shared CXL mapping.
+    std::string shared_region_path;
+    bool bootstrap_owner {false};
+    bool create_region_file {false};
+    std::uint64_t bootstrap_timeout_ms {10000};
+
     std::uintptr_t cxl_base_hint {0};
     double scheduler_slack_ratio {0.25};
 

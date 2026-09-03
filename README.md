@@ -48,3 +48,13 @@ cl_runtime_destroy(runtime);
 `cl_gptr_t` is a global offset-based handle, not a process-local virtual
 address. Future `cl_mem_*_acquire/release` calls will resolve it safely for
 read and write access under LoomMem's coherence rules.
+
+## Shared Region Bootstrap
+
+Set `cl_config_t.shared_region_path` to `/dev/dax0.0` on every logical host.
+Exactly one host, normally host zero, sets `bootstrap_owner = 1`; all other
+hosts attach with `bootstrap_owner = 0`. The owner publishes the layout in a
+fixed bootstrap header at region offset zero, and attachers validate it before
+using the mapping. `cl_mem_resolve_local` is available for mapping tests; it
+does not provide coherence protection and must not replace future acquire/
+release APIs.

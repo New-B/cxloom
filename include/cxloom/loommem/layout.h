@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
 
 #include "cxloom/common/types.h"
 
@@ -29,6 +30,31 @@ struct SharedRegionLayout {
     RegionRange shared_data {};
 };
 
+inline constexpr std::uint64_t kBootstrapMagic = 0x43584c4f4f4d424dULL;  // "CXLOOMBM"
+inline constexpr std::uint32_t kBootstrapLayoutVersion = 1;
+
+enum class BootstrapState : std::uint32_t {
+    kUninitialized = 0,
+    kInitializing = 1,
+    kReady = 2,
+    kFailed = 3,
+};
+
+// Resides at offset zero of every shared CXL region. Fields are intentionally
+// pointer-free so every host can interpret the same bytes at a different VA.
+struct alignas(64) BootstrapHeader {
+    std::uint64_t magic {0};
+    std::uint32_t layout_version {0};
+    std::uint32_t header_bytes {0};
+    std::atomic<std::uint32_t> state {static_cast<std::uint32_t>(BootstrapState::kUninitialized)};
+    std::uint32_t reserved0 {0};
+    std::uint64_t region_bytes {0};
+    std::uint16_t host_count {0};
+    std::uint16_t reserved1 {0};
+    std::uint32_t reserved2 {0};
+    SharedRegionLayout layout {};
+};
+
 struct ObjectMetadata {
     ObjectId object_id {0};
     GlobalPointer base {};
@@ -49,4 +75,3 @@ struct ReplicaMetadata {
 SharedRegionLayout BuildDefaultLayout(std::size_t total_bytes);
 
 }  // namespace cxloom::loommem
-

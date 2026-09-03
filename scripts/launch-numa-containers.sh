@@ -192,6 +192,8 @@ for ((host_id = 0; host_id < CONTAINER_COUNT; ++host_id)); do
         --env "CL_HOST_ID=${host_id}" \
         --env "CL_HOST_COUNT=${CONTAINER_COUNT}" \
         --env "CL_COMPUTE_NUMA_NODE=${compute_numa_node}" \
+        --env "CL_DAX_DEVICE=/dev/dax0.0" \
+        --env "CL_BOOTSTRAP_OWNER=$([[ ${host_id} -eq 0 ]] && echo 1 || echo 0)" \
         --env "CL_SHARED_BACKING=/cxloom-shared/cxloom.region" \
         --env "CL_SHARED_REGION_BYTES=${CXLOOM_SHARED_REGION_BYTES}" \
         "${CXLOOM_IMAGE}" sleep infinity

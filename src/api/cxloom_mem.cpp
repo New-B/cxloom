@@ -25,6 +25,14 @@ cxloom::CxloomConfig ToCppConfig(const cl_config_t& config) {
     result.per_host_extent_bytes = config.per_host_extent_bytes;
     result.coherence_granule_bytes = config.coherence_granule_bytes;
     result.queue_capacity_entries = config.queue_capacity_entries;
+    if (config.shared_region_path != nullptr) {
+        result.shared_region_path = config.shared_region_path;
+    }
+    result.bootstrap_owner = config.bootstrap_owner != 0;
+    result.create_region_file = config.create_region_file != 0;
+    if (config.bootstrap_timeout_ms != 0) {
+        result.bootstrap_timeout_ms = config.bootstrap_timeout_ms;
+    }
     return result;
 }
 
@@ -73,4 +81,16 @@ extern "C" cl_status_t cl_mem_free(cl_runtime_t* runtime, cl_gptr_t gptr) {
         return CL_INVALID_ARGUMENT;
     }
     return ToCStatus(runtime->loommem.FreeShared({gptr.region_id, gptr.offset}));
+}
+
+extern "C" cl_status_t cl_mem_resolve_local(cl_runtime_t* runtime, cl_gptr_t gptr, void** out_address) {
+    if (runtime == nullptr || out_address == nullptr) {
+        return CL_INVALID_ARGUMENT;
+    }
+    const auto result = runtime->loommem.ResolveLocal({gptr.region_id, gptr.offset});
+    if (!result.ok()) {
+        return ToCStatus(result.status());
+    }
+    *out_address = result.value();
+    return CL_OK;
 }

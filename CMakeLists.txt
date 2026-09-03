@@ -18,6 +18,7 @@ add_library(cxloom_loommem STATIC
     src/loommem/allocator.cpp
     src/loommem/coherence.cpp
     src/loommem/queue.cpp
+    src/loommem/region_mapper.cpp
     src/loommem/runtime.cpp
 )
 target_include_directories(cxloom_loommem PUBLIC include)
@@ -39,6 +40,9 @@ target_link_libraries(cxloom PUBLIC cxloom_loommem)
 add_executable(cxloom_smoke examples/smoke_main.cpp)
 target_link_libraries(cxloom_smoke PRIVATE cxloom_common cxloom_loommem cxloom_loompar)
 
+add_executable(cxloom_dax_bootstrap examples/dax_bootstrap_main.cpp)
+target_link_libraries(cxloom_dax_bootstrap PRIVATE cxloom_loommem)
+
 enable_testing()
 
 add_executable(cxloom_allocator_test tests/allocator_test.cpp)
@@ -49,3 +53,7 @@ add_executable(cxloom_cl_mem_api_test tests/cl_mem_api_test.c)
 target_link_libraries(cxloom_cl_mem_api_test PRIVATE cxloom)
 set_target_properties(cxloom_cl_mem_api_test PROPERTIES LINKER_LANGUAGE CXX)
 add_test(NAME cxloom_cl_mem_api_test COMMAND cxloom_cl_mem_api_test)
+
+add_executable(cxloom_shared_region_test tests/shared_region_test.cpp)
+target_link_libraries(cxloom_shared_region_test PRIVATE cxloom_loommem)
+add_test(NAME cxloom_shared_region_test COMMAND cxloom_shared_region_test)

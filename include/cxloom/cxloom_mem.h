@@ -21,6 +21,11 @@ typedef struct {
     size_t per_host_extent_bytes;
     size_t coherence_granule_bytes;
     size_t queue_capacity_entries;
+    const char *shared_region_path;
+    uint8_t bootstrap_owner;
+    uint8_t create_region_file;
+    uint16_t reserved0;
+    uint64_t bootstrap_timeout_ms;
 } cl_config_t;
 
 typedef enum {
@@ -41,6 +46,11 @@ void cl_runtime_destroy(cl_runtime_t *runtime);
 // Allocates and releases an object from the shared CXL data region.
 cl_status_t cl_mem_alloc(cl_runtime_t *runtime, size_t bytes, size_t alignment, cl_gptr_t *out_gptr);
 cl_status_t cl_mem_free(cl_runtime_t *runtime, cl_gptr_t gptr);
+
+// Resolves an offset-based global pointer into this host's mapping. This raw
+// address is for bootstrap/mapping tests only until coherence acquire/release
+// operations are added.
+cl_status_t cl_mem_resolve_local(cl_runtime_t *runtime, cl_gptr_t gptr, void **out_address);
 
 #ifdef __cplusplus
 }

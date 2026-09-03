@@ -43,6 +43,19 @@ been onlined as Linux system RAM rather than exposed as a DAX device. Scripts
 therefore mount `run/cxl-shared` at `/cxloom-shared` and export
 `CL_SHARED_BACKING` for the future `mmap(MAP_SHARED)` region mapper.
 
-The current skeleton does not yet use this backing path: allocator metadata and
-queues remain process-local. Smoke tests validate container placement and build
-health only, not cross-container memory sharing.
+The launcher now passes `/dev/dax0.0` through and exports `CL_DAX_DEVICE` plus
+`CL_BOOTSTRAP_OWNER`. Applications must pass these values into `cl_config_t`.
+LoomMem can map the DAX device and establish its shared bootstrap header, but
+allocator metadata and queues remain process-local. Cross-container allocation,
+queue transport, and coherence are therefore not available yet.
+
+After launching containers, verify the real DAX mapping and bootstrap protocol:
+
+```bash
+./scripts/run-dax-bootstrap-containers.sh 4
+```
+
+The script runs host zero first with `CL_BOOTSTRAP_OWNER=1`, then starts the
+remaining hosts in attach mode. Each line prints a host ID, its local mapping
+base, and the common shared-data offset. Bases may differ; the offset must be
+identical for every host.

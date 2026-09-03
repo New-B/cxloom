@@ -8,6 +8,7 @@
 #include "cxloom/loommem/coherence.h"
 #include "cxloom/loommem/layout.h"
 #include "cxloom/loommem/queue.h"
+#include "cxloom/loommem/region_mapper.h"
 
 namespace cxloom::loommem {
 
@@ -24,16 +25,24 @@ public:
 
     Result<GlobalPointer> AllocateShared(std::size_t bytes, std::size_t alignment);
     Status FreeShared(GlobalPointer gptr);
+    Result<void*> ResolveLocal(const GlobalPointer& gptr) const;
     Result<HostId> ResolvePreferredHost(const GlobalPointer& gptr) const;
     Result<SpscQueue*> GetQueue(HostId producer, HostId consumer);
+    const RegionMapper& region_mapper() const { return region_mapper_; }
 
 private:
     CxloomConfig config_;
     SharedRegionLayout layout_ {};
+    RegionMapper region_mapper_;
+    BootstrapHeader* bootstrap_ {nullptr};
     std::unique_ptr<GlobalAllocator> allocator_;
     std::unique_ptr<CoherenceManager> coherence_;
     std::vector<std::vector<std::unique_ptr<SpscQueue>>> queues_;
     bool initialized_ {false};
+
+    Status InitializeBootstrap();
+    Status AttachBootstrap();
+    Status ValidateBootstrap(const BootstrapHeader& header) const;
 };
 
 }  // namespace cxloom::loommem
