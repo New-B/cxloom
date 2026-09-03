@@ -1,8 +1,9 @@
 #pragma once
 
+#include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <atomic>
 
 #include "cxloom/common/types.h"
 
@@ -31,13 +32,25 @@ struct SharedRegionLayout {
 };
 
 inline constexpr std::uint64_t kBootstrapMagic = 0x43584c4f4f4d424dULL;  // "CXLOOMBM"
-inline constexpr std::uint32_t kBootstrapLayoutVersion = 1;
+inline constexpr std::uint32_t kBootstrapLayoutVersion = 2;
 
 enum class BootstrapState : std::uint32_t {
     kUninitialized = 0,
     kInitializing = 1,
     kReady = 2,
     kFailed = 3,
+};
+
+enum class HostRegistrationState : std::uint32_t {
+    kEmpty = 0,
+    kJoined = 1,
+    kProbeReady = 2,
+};
+
+struct alignas(64) HostRegistration {
+    std::atomic<std::uint32_t> state {static_cast<std::uint32_t>(HostRegistrationState::kEmpty)};
+    std::uint32_t reserved {0};
+    std::atomic<std::uint64_t> probe_value {0};
 };
 
 // Resides at offset zero of every shared CXL region. Fields are intentionally
@@ -53,6 +66,9 @@ struct alignas(64) BootstrapHeader {
     std::uint16_t reserved1 {0};
     std::uint32_t reserved2 {0};
     SharedRegionLayout layout {};
+    std::atomic<std::uint32_t> joined_hosts {0};
+    std::uint32_t reserved3 {0};
+    std::array<HostRegistration, kMaxHosts> hosts {};
 };
 
 struct ObjectMetadata {

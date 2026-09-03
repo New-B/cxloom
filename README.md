@@ -58,3 +58,20 @@ fixed bootstrap header at region offset zero, and attachers validate it before
 using the mapping. `cl_mem_resolve_local` is available for mapping tests; it
 does not provide coherence protection and must not replace future acquire/
 release APIs.
+
+## Multi-Host Initialization Test
+
+A logical CXLoom host is a container, not a NUMA node. Containers are assigned
+8 physical cores by default and NUMA-local DRAM (up to 32 GiB), and are spread
+round-robin across the server's compute NUMA nodes. A 128-core, four-NUMA-node
+server can therefore run up to 16 logical hosts.
+
+After launching the containers, run a concurrent shared-DAX initialization test:
+
+```bash
+./scripts/run-host-init-containers.sh 16
+```
+
+Host zero creates a fresh bootstrap session. Every host then registers in its
+own shared cache-line slot, publishes a probe through `/dev/dax0.0`, waits for
+all configured hosts, and validates every peer's probe.

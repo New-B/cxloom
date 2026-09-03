@@ -43,6 +43,9 @@ target_link_libraries(cxloom_smoke PRIVATE cxloom_common cxloom_loommem cxloom_l
 add_executable(cxloom_dax_bootstrap examples/dax_bootstrap_main.cpp)
 target_link_libraries(cxloom_dax_bootstrap PRIVATE cxloom_loommem)
 
+add_executable(cxloom_host_init examples/host_init_main.cpp)
+target_link_libraries(cxloom_host_init PRIVATE cxloom_loommem)
+
 enable_testing()
 
 add_executable(cxloom_allocator_test tests/allocator_test.cpp)

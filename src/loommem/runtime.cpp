@@ -67,6 +67,13 @@ Status LoomMemRuntime::Initialize() {
         return bootstrap_status;
     }
 
+    const auto registration_status = RegisterLocalHost();
+    if (!registration_status.ok()) {
+        bootstrap_ = nullptr;
+        region_mapper_.Unmap();
+        return registration_status;
+    }
+
     allocator_ = std::make_unique<SlabExtentAllocator>(layout_.shared_data.bytes);
     coherence_ = std::make_unique<TokenCoherenceManager>(config_.local_host_id);
 
@@ -144,6 +151,41 @@ Result<void*> LoomMemRuntime::ResolveLocal(const GlobalPointer& gptr) const {
     return base + gptr.offset;
 }
 
+Status LoomMemRuntime::PublishBootstrapProbe(std::uint64_t value) {
+    if (!initialized_ || bootstrap_ == nullptr) return Status::FailedPrecondition("runtime is not initialized");
+    auto& host = bootstrap_->hosts[config_.local_host_id];
+    host.probe_value.store(value, std::memory_order_relaxed);
+    host.state.store(static_cast<std::uint32_t>(HostRegistrationState::kProbeReady), std::memory_order_release);
+    return Status::Ok();
+}
+
+Status LoomMemRuntime::WaitForAllHosts(std::uint64_t timeout_ms) const {
+    if (!initialized_ || bootstrap_ == nullptr) return Status::FailedPrecondition("runtime is not initialized");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+        bool ready = true;
+        for (HostId host = 0; host < config_.host_count; ++host) {
+            const auto state = static_cast<HostRegistrationState>(bootstrap_->hosts[host].state.load(std::memory_order_acquire));
+            if (state != HostRegistrationState::kProbeReady) { ready = false; break; }
+        }
+        if (ready) return Status::Ok();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return Status::Unavailable("timed out waiting for all hosts to publish bootstrap probes");
+}
+
+Result<std::uint64_t> LoomMemRuntime::ReadBootstrapProbe(HostId host) const {
+    if (!initialized_ || bootstrap_ == nullptr) return Status::FailedPrecondition("runtime is not initialized");
+    if (host >= config_.host_count) return Status::InvalidArgument("probe host is out of range");
+    const auto state = static_cast<HostRegistrationState>(bootstrap_->hosts[host].state.load(std::memory_order_acquire));
+    if (state != HostRegistrationState::kProbeReady) return Status::Unavailable("host probe is not ready");
+    return bootstrap_->hosts[host].probe_value.load(std::memory_order_relaxed);
+}
+
+std::uint32_t LoomMemRuntime::joined_host_count() const {
+    return bootstrap_ == nullptr ? 0 : bootstrap_->joined_hosts.load(std::memory_order_acquire);
+}
+
 Result<HostId> LoomMemRuntime::ResolvePreferredHost(const GlobalPointer& gptr) const {
     if (config_.host_count == 0) {
         return Status::FailedPrecondition("host_count is zero");
@@ -204,6 +246,16 @@ Status LoomMemRuntime::ValidateBootstrap(const BootstrapHeader& header) const {
     if (!SameLayout(header.layout, layout_)) {
         return Status::FailedPrecondition("shared region layout differs from this LoomMem build configuration");
     }
+    return Status::Ok();
+}
+
+Status LoomMemRuntime::RegisterLocalHost() {
+    auto& registration = bootstrap_->hosts[config_.local_host_id];
+    std::uint32_t expected = static_cast<std::uint32_t>(HostRegistrationState::kEmpty);
+    if (!registration.state.compare_exchange_strong(expected, static_cast<std::uint32_t>(HostRegistrationState::kJoined), std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return Status::AlreadyExists("local host id is already registered in this bootstrap session");
+    }
+    bootstrap_->joined_hosts.fetch_add(1, std::memory_order_acq_rel);
     return Status::Ok();
 }
 

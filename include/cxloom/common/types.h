@@ -12,6 +12,8 @@ using ThreadLocalId = std::uint64_t;
 using Version = std::uint64_t;
 using ObjectId = std::uint64_t;
 
+inline constexpr std::size_t kMaxHosts = 64;
+
 struct GlobalPointer {
     std::uint32_t region_id {0};
     std::uint64_t offset {0};

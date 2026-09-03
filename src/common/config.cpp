@@ -11,6 +11,9 @@ Status ConfigValidator::Validate(const CxloomConfig& config) {
     if (config.local_host_id >= config.host_count) {
         return Status::InvalidArgument("local_host_id must be smaller than host_count");
     }
+    if (config.host_count > kMaxHosts) {
+        return Status::InvalidArgument("host_count exceeds the bootstrap host table capacity");
+    }
     if (config.shared_region_bytes == 0 || config.per_host_extent_bytes == 0) {
         return Status::InvalidArgument("shared region and extent sizes must be non-zero");
     }

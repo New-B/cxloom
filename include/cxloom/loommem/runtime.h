@@ -26,6 +26,10 @@ public:
     Result<GlobalPointer> AllocateShared(std::size_t bytes, std::size_t alignment);
     Status FreeShared(GlobalPointer gptr);
     Result<void*> ResolveLocal(const GlobalPointer& gptr) const;
+    Status PublishBootstrapProbe(std::uint64_t value);
+    Status WaitForAllHosts(std::uint64_t timeout_ms) const;
+    Result<std::uint64_t> ReadBootstrapProbe(HostId host) const;
+    std::uint32_t joined_host_count() const;
     Result<HostId> ResolvePreferredHost(const GlobalPointer& gptr) const;
     Result<SpscQueue*> GetQueue(HostId producer, HostId consumer);
     const RegionMapper& region_mapper() const { return region_mapper_; }
@@ -43,6 +47,7 @@ private:
     Status InitializeBootstrap();
     Status AttachBootstrap();
     Status ValidateBootstrap(const BootstrapHeader& header) const;
+    Status RegisterLocalHost();
 };
 
 }  // namespace cxloom::loommem

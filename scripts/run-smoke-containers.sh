@@ -6,8 +6,8 @@ set -euo pipefail
 # yet map allocator metadata or queues into the shared CXL backing file.
 CONTAINER_COUNT="${1:-4}"
 
-if ! [[ "${CONTAINER_COUNT}" =~ ^[1-4]$ ]]; then
-    echo "container-count must be an integer from 1 to 4" >&2
+if ! [[ "${CONTAINER_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "container-count must be a positive integer" >&2
     exit 1
 fi
 
