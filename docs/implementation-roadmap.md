@@ -97,7 +97,7 @@ Goal:
 
 Tasks:
 
-1. initialize an append-only global shared-data pool
+1. initialize global data and coherence-sidecar extent pools
 2. reserve aligned object space with a shared atomic cursor
 3. store allocation metadata inline before each object
 4. validate and resolve allocation-base GPtrs across hosts
@@ -132,7 +132,7 @@ Progress:
 - two-host integration coverage validates bidirectional handoff, publication, and stale-lease rejection
 - container and runtime initialization now derive queue topology and capacity from a 1..64 host count
 - variable-scale token and all-pairs queue tests validate non-fixed host counts
-- immutable host-local replicas are cached by allocation generation and version
+- immutable host-local block replicas are cached by allocation ID and version
 - readers refresh with an even/odd coherence epoch that rejects concurrent partial writeback
 - write buffers integrate token acquisition, data publication, version increment, and cache update
 - multi-runtime and variable-scale devdax tests cover single-writer/multi-reader refresh
@@ -142,6 +142,63 @@ Exit criteria:
 - one writer at a time is enforced
 - stale readers are detected and refreshed
 - release consistency semantics can be built on top
+
+### Phase 5B: Block-Granular Coherence
+
+The next LoomMem evolution keeps allocations as addressing and lifetime units
+while introducing configurable coherence blocks as token, version, writeback,
+and replica-cache units. See `coherence-block-design.md` for the normative
+design.
+
+Implementation order:
+
+1. split allocation metadata from dense block sidecar metadata while preserving
+   whole-object behavior
+2. add per-allocation block-size selection and single-block range APIs
+3. migrate the replica LRU and token messages to block identity
+4. support canonical-order multi-block acquisition and per-block commits
+5. add optional whole-range atomic publication
+6. retire objects after global reference quiescence and return their data and
+   sidecar extents to independent coalescing pools
+
+Progress:
+
+- added runtime-default and allocation-level object/fixed-block selection
+- added a versioned coherence-region header and dense block sidecar allocator
+- allocation descriptors record block size, count, sidecar offset, object
+  version, and the whole-range commit epoch
+- object mode initializes one sidecar block; fixed-block mode initializes the
+  calculated block array with bounds-checked lookup
+- block sidecars are published before allocation/bootstrap publication
+- token messages, leases, arbitration, versions, and writeback epochs use
+  `<object, allocation ID, block index>` identity
+- byte-range read/write APIs support single- and multi-block ranges while the
+  whole-object APIs remain compatibility wrappers
+- multi-block writers acquire tokens in ascending block order and roll back
+  partial acquisition on failure
+- the bounded replica LRU caches individual full blocks and assembles immutable
+  range snapshots
+- optional whole-range reads and writes use the allocation commit epoch as an
+  object-wide seqlock, while default range operations retain per-block
+  atomicity
+- per-host shared reference counters cover read-copy intervals, write-buffer
+  lifetimes, and explicit object references
+- object-wide retirement prevents new acquires, waits for references and
+  writebacks to drain, invalidates the descriptor, and independently returns
+  data and sidecar extents to split/coalesce free pools
+- each allocation creates a new descriptor and allocation ID; delayed token
+  messages carrying an older ID are rejected
+- token failures and cancellation complete explicitly through TOKEN_REJECT,
+  TOKEN_CANCEL, and TOKEN_CANCEL_ACK; cancelled waiter state is reclaimed
+- retirement drains every current block owner's pending queue, rejects those
+  requests with kRetiring, and waits for per-block TOKEN_RETIRE_ACK before
+  reclaiming descriptor or sidecar storage
+
+Compatibility requirement:
+
+- existing whole-object APIs remain wrappers over the full object range
+- every intermediate step keeps the current allocator, token, and coherence
+  tests passing
 
 ## Phase 6: LoomPar Lifecycle Control
 
@@ -236,10 +293,11 @@ That order keeps the control plane from getting ahead of the data-plane guarante
 ## Current Shared Allocator V1 Boundary
 
 The initial Phase 4 slice now uses owner-formatted allocator metadata in the
-shared CXL region. It provides a global atomic bump pool, stable offset-based global pointers, inline allocation descriptors without a per-host record limit, allocation and owner lookup, and multi-host read-only bring-up tests.
+shared CXL region. The original slice provided a bump pool; the current
+allocator uses independent, shared data and sidecar extent indexes with
+splitting and adjacent-range coalescing.
 
-This V1 is intentionally append-only. Reclamation, generation reuse, remote
-lifetime tracking, and a general object directory remain future work. The next
-platform step after validating this allocator on real devdax is the now-available visibility
-and ordering litmus suite used to replace generic C++ release/acquire
-assumptions with a measured CXL publication recipe.
+Current object retirement tracks active references per host, blocks new
+acquires through `RETIRING`, waits for references and writebacks to drain, and
+then invalidates the descriptor before returning both extents. A measured CXL
+publication recipe and host-failure recovery remain future work.

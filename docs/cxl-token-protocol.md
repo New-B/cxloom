@@ -1,28 +1,28 @@
 # Queue-Based Write Token Protocol
 
-LoomMem serializes mutations of each shared allocation with one write token.
-The allocator initializes the token to the allocating host with version 0 and
-epoch 1. AllocationDescriptor token_owner, version, and token_epoch are the
-authoritative CXL-resident state; queue messages are notifications, not an
-alternative source of truth.
+LoomMem serializes mutations independently for each coherence block. The
+allocator initializes every block sidecar to the allocating host with version
+0 and token epoch 1. Sidecar metadata is authoritative; queue messages are
+notifications rather than an alternative source of truth.
 
 A host calls RequestWriteToken, keeps the returned request handle, and waits
 with WaitForWriteToken. If the token is remote, TOKEN_REQ is sent on the
 requester's outbound SPSC queue. A stale owner forwards the request using its
 own outbound queue while preserving the original requester and request ID.
-The current owner serializes accepted requests per object in local FIFO order.
+The current owner serializes accepted requests per block in local FIFO order.
 
 ReleaseWriteToken performs the handoff in this order:
 
-1. validate generation, owner, epoch, and the locally active lease;
-2. publish the mutated object using the configured visibility recipe;
-3. increment and publish the object version;
+1. validate allocation ID, block identity, owner, epoch, and active lease;
+2. publish the mutated block using the configured visibility recipe;
+3. increment and publish the block version;
 4. increment the token epoch and publish the new owner;
 5. enqueue TOKEN_GRANT to the new owner.
 
-The receiver acquires the shared descriptor and accepts a grant only when its
-generation, owner, version, and epoch match the grant. A lease from an earlier
-epoch cannot be released again.
+The receiver accepts a grant only when its allocation ID, block owner, version,
+and epoch match authoritative metadata. A delayed message for a freed object
+cannot affect a later allocation at the same GPtr because every allocation
+receives a new monotonic allocation ID.
 
 ## Cross-queue ordering
 
@@ -39,13 +39,34 @@ granted writer releases, those requests are served in the established local
 order.
 
 The request handle remains active after a wait timeout, so callers may wait on
-the same handle again. Automatic retry and host-failure recovery are not part
-of this first protocol version.
+the same handle again or cancel it. Owners explicitly answer an invalid,
+stale-allocation, or retiring request with TOKEN_REJECT. Cancellation uses
+TOKEN_CANCEL and TOKEN_CANCEL_ACK; if a grant won the race, the requester
+immediately releases the late grant. Both synchronous cancellation and the
+fire-and-forget cancellation path reclaim terminal waiter state. Automatic
+retry and host-failure recovery are not part of this protocol version.
+
+## Retirement drain
+
+After the allocation owner changes an object from ALLOCATED to RETIRING, it
+sends TOKEN_RETIRE for every coherence block to that block's current token
+owner. The token owner atomically detaches its local pending queue, completes
+every detached request with TOKEN_REJECT(kRetiring), and then replies with
+TOKEN_RETIRE_ACK. Stale owners forward TOKEN_RETIRE according to authoritative
+sidecar ownership.
+
+FreeShared does not begin reference quiescence or release the descriptor and
+sidecar extents until every block acknowledgment arrives. Requests that race
+with the drain observe RETIRING in HandleRequest and are rejected directly.
+Consequently, deleting per-allocation token state cannot strand a normally
+queued requester.
 
 ## Runtime integration
 
-StartQueuePoller always installs an internal dispatcher for TOKEN_REQ and
-TOKEN_GRANT; an optional application handler receives all other message kinds.
+StartQueuePoller always installs an internal dispatcher for TOKEN_REQ,
+TOKEN_GRANT, TOKEN_REJECT, TOKEN_CANCEL, TOKEN_CANCEL_ACK, TOKEN_RETIRE, and
+TOKEN_RETIRE_ACK; an optional application handler receives all other message
+kinds.
 Token APIs require a shared runtime and a running poller.
 
 cxloom_token_test maps two runtimes to the same backing file and covers a

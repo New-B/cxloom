@@ -41,7 +41,10 @@ therefore mount `run/cxl-shared` at `/cxloom-shared` and export
 
 The launcher now passes `/dev/dax0.0` through and exports `CL_DAX_DEVICE` plus
 `CL_BOOTSTRAP_OWNER`. Applications must pass these values into `cl_config_t`.
-LoomMem maps the DAX device, establishes its shared bootstrap header, and initializes one global append-only allocation pool. Shared free/reuse, queue transport, and coherence are not available yet.
+LoomMem maps the DAX device, establishes its shared bootstrap header, and
+initializes independent shared extent pools for object data and coherence
+sidecars. Queue transport, block coherence, host-reference tracking, and safe
+object retirement are available in the current runtime.
 
 After launching containers, verify the real DAX mapping and bootstrap protocol:
 

@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "cxloom/common/status.h"
+#include "cxloom/common/config.h"
 #include "cxloom/common/types.h"
 
 namespace cxloom::loommem {
@@ -64,7 +65,9 @@ class SlabExtentAllocator final : public GlobalAllocator {
 
 inline constexpr std::uint64_t kAllocatorMagic = 0x43584c4f4f4d414cULL;
 inline constexpr std::uint64_t kAllocationMagic = 0x43584c4f4f4d4f42ULL;
-inline constexpr std::uint32_t kAllocatorLayoutVersion = 5;
+inline constexpr std::uint32_t kAllocatorLayoutVersion = 8;
+inline constexpr std::uint32_t kInvalidExtentIndex = UINT32_MAX;
+inline constexpr std::size_t kMaxSharedExtentNodes = 8192;
 
 enum class AllocatorState : std::uint32_t {
     kUninitialized = 0,
@@ -76,6 +79,7 @@ enum class AllocatorState : std::uint32_t {
 enum class AllocationState : std::uint32_t {
     kEmpty = 0,
     kAllocated = 1,
+    kRetiring = 2,
 };
 
 struct AllocationInfo {
@@ -84,8 +88,38 @@ struct AllocationInfo {
     std::uint64_t alignment {0};
     HostId owner_host {0};
     std::uint64_t allocation_id {0};
-    std::uint64_t generation {0};
+    std::uint64_t coherence_block_bytes {0};
+    std::uint64_t coherence_block_count {0};
+    std::uint64_t coherence_metadata_offset {0};
 };
+
+struct AllocationOptions {
+    std::size_t bytes {0};
+    std::size_t alignment {0};
+    CoherenceGranularity coherence_granularity {CoherenceGranularity::kObject};
+    std::size_t coherence_block_bytes {0};
+};
+
+inline constexpr std::uint64_t kCoherenceRegionMagic = 0x43584c4f4f4d4348ULL;
+inline constexpr std::uint32_t kCoherenceRegionLayoutVersion = 2;
+
+struct alignas(64) CoherenceBlockDescriptor {
+    std::atomic<std::uint32_t> token_owner {0};
+    std::atomic<std::uint64_t> version {0};
+    std::atomic<std::uint64_t> token_epoch {0};
+    std::atomic<std::uint64_t> writeback_epoch {0};
+};
+
+struct alignas(64) CoherenceRegionHeader {
+    std::uint64_t magic {0};
+    std::uint32_t layout_version {0};
+    std::uint32_t header_bytes {0};
+    std::uint64_t region_offset {0};
+    std::uint64_t region_bytes {0};
+};
+
+Status FormatCoherenceRegion(CoherenceRegionHeader* header, std::uint64_t region_offset,
+                             std::uint64_t region_bytes);
 
 struct alignas(64) AllocationDescriptor {
     std::uint64_t magic {0};
@@ -96,12 +130,24 @@ struct alignas(64) AllocationDescriptor {
     std::uint64_t object_offset {0};
     std::uint64_t bytes {0};
     std::uint64_t alignment {0};
-    std::uint64_t generation {0};
-    std::atomic<std::uint32_t> token_owner {0};
-    std::atomic<std::uint64_t> version {0};
-    std::atomic<std::uint64_t> token_epoch {0};
-    // Even when shared data is stable; odd while the token holder may publish.
-    std::atomic<std::uint64_t> coherence_epoch {0};
+    std::uint64_t coherence_block_bytes {0};
+    std::uint64_t coherence_block_count {0};
+    std::uint64_t coherence_metadata_offset {0};
+    std::uint64_t data_extent_offset {0};
+    std::uint64_t data_extent_bytes {0};
+    std::uint64_t coherence_extent_bytes {0};
+    std::atomic<std::uint64_t> object_version {0};
+    std::atomic<std::uint64_t> range_commit_epoch {0};
+    std::array<std::atomic<std::uint64_t>, kMaxHosts> active_references {};
+};
+
+enum class SharedExtentState : std::uint32_t { kUnused = 0, kFree = 1 };
+
+struct SharedExtentNode {
+    std::uint64_t offset {0};
+    std::uint64_t bytes {0};
+    std::uint32_t next {kInvalidExtentIndex};
+    std::uint32_t state {static_cast<std::uint32_t>(SharedExtentState::kUnused)};
 };
 
 struct alignas(64) AllocatorHeader {
@@ -112,24 +158,39 @@ struct alignas(64) AllocatorHeader {
     std::uint32_t reserved0 {0};
     std::uint64_t shared_data_offset {0};
     std::uint64_t shared_data_bytes {0};
-    std::atomic<std::uint64_t> next_offset {0};
-    std::atomic<std::uint64_t> allocation_count {0};
+    std::atomic<std::uint64_t> next_allocation_id {1};
+    std::atomic<std::uint32_t> extent_lock {0};
+    std::uint32_t data_free_head {kInvalidExtentIndex};
+    std::uint32_t coherence_free_head {kInvalidExtentIndex};
+    std::uint32_t extent_node_capacity {0};
+    std::uint32_t reserved1 {0};
+    std::array<SharedExtentNode, kMaxSharedExtentNodes> extent_nodes {};
 };
 
 Status FormatSharedAllocator(AllocatorHeader* header, std::size_t allocator_region_bytes,
-                             std::uint64_t shared_data_offset, std::uint64_t shared_data_bytes);
+                             std::uint64_t shared_data_offset, std::uint64_t shared_data_bytes,
+                             std::uint64_t coherence_offset, std::uint64_t coherence_bytes);
 
-class SharedBumpAllocator final : public GlobalAllocator {
+class SharedExtentAllocator final : public GlobalAllocator {
   public:
-    SharedBumpAllocator(AllocatorHeader* header, void* region_base, std::size_t region_bytes, HostId local_host,
-                        std::uint64_t expected_data_offset, std::uint64_t expected_data_bytes);
+    SharedExtentAllocator(AllocatorHeader* header, void* region_base, std::size_t region_bytes, HostId local_host,
+                        std::uint64_t expected_data_offset, std::uint64_t expected_data_bytes,
+                        CoherenceRegionHeader* coherence_header = nullptr,
+                        CoherenceGranularity default_granularity = CoherenceGranularity::kObject,
+                        std::size_t default_block_bytes = 4096);
 
     Status Initialize() override;
     Result<GlobalPointer> Allocate(std::size_t bytes, std::size_t alignment) override;
     Status Free(GlobalPointer gptr) override;
     Result<AllocationInfo> Describe(GlobalPointer gptr) const;
     Result<HostId> OwningHost(GlobalPointer gptr) const;
-    Result<AllocationDescriptor*> MutableDescriptor(GlobalPointer gptr) const;
+    Result<AllocationDescriptor*> MutableDescriptor(GlobalPointer gptr, bool allow_retiring = false) const;
+    Result<AllocationDescriptor*> AcquireReference(GlobalPointer gptr, HostId host) const;
+    Status ReleaseReference(AllocationDescriptor* descriptor, std::uint64_t allocation_id, HostId host) const;
+    Status CancelRetire(AllocationDescriptor* descriptor, std::uint64_t allocation_id) const;
+    Result<CoherenceBlockDescriptor*> MutableCoherenceBlock(GlobalPointer gptr, std::uint64_t block_index,
+                                                             bool allow_retiring = false) const;
+    Result<GlobalPointer> Allocate(const AllocationOptions& options);
 
   private:
     AllocatorHeader* header_ {nullptr};
@@ -138,7 +199,17 @@ class SharedBumpAllocator final : public GlobalAllocator {
     HostId local_host_ {0};
     std::uint64_t expected_data_offset_ {0};
     std::uint64_t expected_data_bytes_ {0};
+    CoherenceRegionHeader* coherence_header_ {nullptr};
+    CoherenceGranularity default_granularity_ {CoherenceGranularity::kObject};
+    std::size_t default_block_bytes_ {4096};
     bool initialized_ {false};
+
+    void LockExtents() const;
+    void UnlockExtents() const;
+    Result<std::uint32_t> ReserveExtentNodeLocked() const;
+    Result<std::uint64_t> AllocateExtentLocked(std::uint32_t* head, std::uint64_t bytes,
+                                               std::size_t alignment) const;
+    Status FreeExtentLocked(std::uint32_t* head, std::uint64_t offset, std::uint64_t bytes) const;
 };
 
 }  // namespace cxloom::loommem

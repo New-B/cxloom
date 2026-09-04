@@ -60,7 +60,7 @@ int main(void) {
     *(uint64_t*)attacher_local = UINT64_C(0x43584c4f4f4d0001);
     if (*(uint64_t*)owner_remote != UINT64_C(0x43584c4f4f4d0000) ||
         *(uint64_t*)attacher_remote != UINT64_C(0x43584c4f4f4d0001) ||
-        cl_mem_free(owner, owner_object) != CL_UNIMPLEMENTED) {
+        cl_mem_free(owner, owner_object) != CL_OK) {
         goto done;
     }
     success = 1;

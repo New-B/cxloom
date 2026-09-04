@@ -1,7 +1,8 @@
 # LoomMem Single-Writer/Multi-Reader Coherence
 
-Each shared allocation has CXL-resident authoritative metadata and host-private
-immutable read replicas.
+Each shared allocation has an ephemeral allocation descriptor, CXL-resident
+per-block authoritative metadata, shared per-host activity counters, and
+host-private immutable block replicas.
 
 ## Public operations
 
@@ -30,21 +31,21 @@ LRU limits as reader-created replicas.
 
 ## Stable-copy protocol
 
-AllocationDescriptor coherence_epoch is even while shared object bytes are
-stable and odd only during writeback to those bytes. Acquiring a buffered write
-token leaves the epoch even because the application modifies a host-private
-buffer. Release moves the epoch to odd immediately before copying that buffer
-to CXL, publishes data, increments version, then moves the epoch back to even.
+Each block sidecar's writeback epoch is even while that block is stable and odd
+only during writeback. Acquiring a buffered write token leaves it even because
+the application modifies a host-private buffer. Release makes the affected
+block epoch odd immediately before copying, publishes data, increments its
+version, then restores an even epoch.
 Consequently, readers can continue to acquire the last committed version while
 a writer holds and modifies its private buffer.
 
 A reader:
 
-1. acquires descriptor metadata;
-2. waits while coherence_epoch is odd;
-3. records coherence_epoch, generation, and version;
-4. copies the shared bytes;
-5. acquires descriptor metadata again;
+1. acquires an object reference in its host's shared activity slot;
+2. waits while the block writeback epoch is odd;
+3. records allocation ID, block epoch, and block version;
+4. copies the shared block bytes;
+5. acquires sidecar metadata again;
 6. accepts the copy only when epoch and version are unchanged and the epoch is
    even; otherwise it retries.
 
@@ -53,15 +54,14 @@ on different hosts to consume immutable snapshots concurrently.
 
 ## Scope
 
-The protocol currently operates at allocation granularity. A new read may
+The protocol operates at configurable block granularity. A new read may
 return the last committed version while a buffered writer holds the token, and
 only waits or retries during the writer's actual CXL writeback window. An
 already acquired immutable snapshot may be used until its owner explicitly
 acquires another snapshot. A timed-out
 synchronous write acquisition abandons its request; a late grant is released
-without changing the object version. Failure recovery, eviction policy,
-sub-allocation coherence granules, and automatic refresh of previously
-returned pointers are future work.
+without changing the block version. Whole-range atomic publication and host
+failure recovery remain future work.
 
 The three-runtime unit test covers parallel readers, reading the last committed
 version while a buffered writer is active, stale replica refresh, immutable old

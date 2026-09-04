@@ -66,6 +66,7 @@ int main() {
     config.bootstrap_owner = true;
     config.create_region_file = true;
     config.queue_capacity_entries = 64;
+    config.bootstrap_timeout_ms = 2000;
     config.replica_cache_capacity_entries = 1;
     config.replica_cache_capacity_bytes = sizeof(Record);
 
@@ -140,6 +141,7 @@ int main() {
     const auto abandoned_write = host1.AcquireWriteBuffer(object.value(), 10);
     passed = passed && held_write.ok() && !abandoned_write.ok() &&
              abandoned_write.status().code() == cxloom::StatusCode::kUnavailable &&
+             host1.pending_token_request_count() == 0 &&
              host0.ReleaseWriteBuffer(held_write.value()).ok();
     auto write_after_cancel = host2.AcquireWriteBuffer(object.value(), 2000);
     passed = passed && write_after_cancel.ok() && write_after_cancel.value().lease.version == 3 &&
@@ -166,6 +168,37 @@ int main() {
     const auto reloaded_snapshot = host2.AcquireReadSnapshot(object.value(), 2000);
     passed = passed && reloaded_snapshot.ok() && reloaded_snapshot.value().version == 5 &&
              Valid(reloaded_snapshot.value(), 2, 1) && host2.cached_replica_count() == 1;
+
+    // Retirement is coordinated with the current (remote) token owner. Any
+    // request already queued there must complete with kRetiring before the
+    // descriptor and sidecar can be reclaimed.
+    const auto retiring_object = host0.AllocateShared(sizeof(Record), alignof(Record));
+    auto retiring_writer = retiring_object.ok()
+                               ? host1.AcquireWriteBuffer(retiring_object.value(), 2000)
+                               : cxloom::Result<cxloom::loommem::WriteBuffer>(retiring_object.status());
+    const auto owner_messages = host1.queue_poller()->stats().messages;
+    const auto retiring_pending = retiring_object.ok()
+                                      ? host2.RequestWriteToken(retiring_object.value())
+                                      : cxloom::Result<cxloom::loommem::TokenRequestHandle>(
+                                            retiring_object.status());
+    const auto pending_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (host1.queue_poller()->stats().messages == owner_messages &&
+           std::chrono::steady_clock::now() < pending_deadline)
+        std::this_thread::yield();
+    auto retiring_free = std::async(std::launch::async, [&] {
+        return retiring_object.ok() ? host0.FreeShared(retiring_object.value()) : retiring_object.status();
+    });
+    const auto rejected_pending = retiring_pending.ok()
+                                      ? host2.WaitForWriteToken(retiring_pending.value(), 2000)
+                                      : cxloom::Result<cxloom::loommem::TokenLease>(retiring_pending.status());
+    const auto retiring_release = retiring_writer.ok()
+                                      ? host1.ReleaseWriteBuffer(retiring_writer.value())
+                                      : retiring_writer.status();
+    const auto retiring_free_status = retiring_free.get();
+    passed = passed && retiring_writer.ok() && retiring_pending.ok() && !rejected_pending.ok() &&
+             rejected_pending.status().code() == cxloom::StatusCode::kFailedPrecondition &&
+             host2.pending_token_request_count() == 0 && retiring_release.ok() && retiring_free_status.ok() &&
+             !host0.DescribeSharedAllocation(retiring_object.value()).ok();
 
     const auto stop2 = host2.StopQueuePoller();
     const auto stop1 = host1.StopQueuePoller();

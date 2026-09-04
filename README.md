@@ -72,22 +72,31 @@ After launching the containers, run a concurrent shared-DAX initialization test:
 ./scripts/run-host-init-containers.sh 16
 ```
 
-Host zero creates a fresh bootstrap session and initializes one global append-only allocation pool. All hosts allocate from the same atomic bump cursor, publish one object, and then validate that every published range is non-overlapping and readable through each local mapping.
+Host zero creates a fresh bootstrap session and initializes independent shared
+extent pools for object data and coherence sidecars.
 
 ## Shared Allocator V1
 
 For a shared DAX mapping, the bootstrap owner formats an allocator header in
-the allocator region. Every host reserves space from one global atomic bump
-cursor. A self-describing metadata prefix is stored immediately before each
-aligned object and records its offset, size, alignment, owner, allocation ID,
-and generation.
+the allocator region. A shared, address-ordered extent index allocates, splits,
+returns, and coalesces free ranges. A self-describing metadata prefix exists
+immediately before an object only while that object is allocated.
 
-Shared allocation count has no per-host descriptor limit and is bounded only by
-the shared-data pool capacity. Allocations are append-only: cl_mem_free returns CL_UNIMPLEMENTED for a DAX-backed runtime.
+Shared allocation count has no per-host descriptor limit and is bounded by the
+shared-data and coherence-metadata regions. `cl_mem_free` retires and reuses an
+entire object after preventing new acquires and waiting for every host's active
+references and all writebacks to drain. Its data and sidecar extents then
+return independently to their free pools; a later allocation creates a new
+descriptor and a new allocation ID.
 ResolveLocal accepts only published allocation base pointers in shared mode;
 arbitrary offsets and interior pointers are rejected. The bootstrap object's
 publication slots are bring-up/test coordination and are not a general-purpose
 object directory.
+
+`GPtr` remains a pure shared address. It becomes invalid immediately after
+free, and using it afterward is a caller error. Formal access uses LoomMem
+read/write acquire APIs or an explicit `ObjectReference`; `ResolveLocal` is
+restricted to bootstrap and mapping diagnostics.
 
 ## CXL-Resident SPSC Queue Transport
 
@@ -127,11 +136,29 @@ if they do not fit.
 
 ## Single-Writer/Multi-Reader Coherence
 
+The public C++ memory API is collected in `cxloom/loommem.h`. Applications use
+`clInit`/`clDestroy`, `clAlloc`, `clRead`/`clReadRange`,
+`clWrite`/`clWriteRange`, and `clFree`. `ReadView` owns an immutable snapshot;
+`WriteView` exposes `data()`, `Commit()`, and `Abort()`, and automatically
+aborts an active view on destruction. Runtime polling, token transfer,
+references, descriptors, and sidecars remain internal to this API.
+
 `AcquireWriteBuffer` and `ReleaseWriteBuffer` combine token ownership with
 version publication. `AcquireReadSnapshot` maintains an immutable host-local
 replica and refreshes it when the shared version advances. A descriptor
 coherence epoch prevents readers from accepting a concurrent partial
 writeback. See `docs/cxl-coherence.md`.
+
+The next coherence-granularity evolution separates allocation identity from
+block-level token, version, writeback, and replica state. The proposed metadata
+layout, range semantics, atomicity modes, allocator integration, and migration
+plan are specified in `docs/coherence-block-design.md`.
+
+Objects remain the allocation and reclamation unit. Within each object,
+configurable coherence blocks are independent token, version, writeback, and
+replica-LRU units. `AcquireReadRange` and `AcquireWriteRange` accept byte ranges;
+multi-block writers acquire tokens in ascending block order. The existing
+whole-object snapshot and write-buffer APIs wrap the full object range.
 
 Run the variable-scale devdax validation with:
 

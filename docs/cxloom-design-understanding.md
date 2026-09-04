@@ -222,7 +222,12 @@ Candidates include:
 
 The design currently leans toward block/object-granular coherence, with `4KB` as a practical V1 starting point.
 
-Allocator design is separated from coherence-token design. The bring-up allocator uses one global atomic bump cursor and stores a self-describing allocation prefix immediately before every object. This removes per-host capacity and descriptor-count limits, at the cost of one shared CAS per allocation. A later scalable allocator may reserve chunks from the global pool and suballocate locally without changing the GlobalPointer contract.
+Allocator design is separated from coherence-token design. The current shared
+allocator keeps address-ordered extent indexes in allocator metadata, with
+independent pools for object data and dense block sidecars. Allocation splits
+free extents; retirement coalesces adjacent ranges. The inline descriptor exists
+only during the object's lifetime and does not change the pure-address GPtr
+contract.
 
 ## 4. LoomPar: What LeoPar Contributes
 
@@ -439,7 +444,7 @@ The two documents together suggest a realistic first implementation target:
 - multi-NUMA logical-host emulation on one machine
 - shared CXL region abstraction
 - global offset-based addressing
-- global append-only allocator with inline allocation descriptors
+- shared split/coalesce extent allocator with ephemeral inline descriptors
 - host-local replica cache
 - dynamic token ownership per block
 - version-based reader freshness

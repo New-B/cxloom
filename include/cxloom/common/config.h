@@ -9,6 +9,11 @@
 
 namespace cxloom {
 
+enum class CoherenceGranularity : std::uint8_t {
+    kObject = 0,
+    kFixedBlock = 1,
+};
+
 struct CxloomConfig {
     HostId local_host_id {0};
     std::uint16_t host_count {1};
@@ -17,6 +22,7 @@ struct CxloomConfig {
     // Legacy process-private placement heuristic; ignored by the shared global allocator.
     std::size_t per_host_extent_bytes {1ULL << 28};
     std::size_t coherence_granule_bytes {4096};
+    CoherenceGranularity default_coherence_granularity {CoherenceGranularity::kObject};
     // Zero selects the largest capacity up to 1024 that fits all directed
     // host-pair queues in the reserved queue region.
     std::size_t queue_capacity_entries {0};

@@ -24,6 +24,10 @@ cxloom::CxloomConfig ToCppConfig(const cl_config_t& config) {
     result.shared_region_bytes = config.shared_region_bytes;
     result.per_host_extent_bytes = config.per_host_extent_bytes;
     result.coherence_granule_bytes = config.coherence_granule_bytes;
+    result.default_coherence_granularity =
+        config.default_coherence_granularity == CL_COHERENCE_FIXED_BLOCK
+            ? cxloom::CoherenceGranularity::kFixedBlock
+            : cxloom::CoherenceGranularity::kObject;
     result.queue_capacity_entries = config.queue_capacity_entries;
     if (config.shared_region_path != nullptr) {
         result.shared_region_path = config.shared_region_path;

@@ -14,6 +14,11 @@ typedef struct {
     uint64_t offset;
 } cl_gptr_t;
 
+typedef enum {
+    CL_COHERENCE_OBJECT = 0,
+    CL_COHERENCE_FIXED_BLOCK = 1,
+} cl_coherence_granularity_t;
+
 typedef struct {
     uint16_t local_host_id;
     uint16_t host_count;
@@ -30,6 +35,7 @@ typedef struct {
     // Zero preserves the C++ runtime defaults.
     size_t replica_cache_capacity_entries;
     size_t replica_cache_capacity_bytes;
+    cl_coherence_granularity_t default_coherence_granularity;
 } cl_config_t;
 
 typedef enum {
@@ -48,7 +54,8 @@ cl_status_t cl_runtime_create(const cl_config_t *config, cl_runtime_t **runtime)
 void cl_runtime_destroy(cl_runtime_t *runtime);
 
 // Allocates an object from the shared CXL data region. Shared DAX allocations
-// use a global append-only pool and cannot yet be freed or reused.
+// are retired as whole objects. Their data and coherence-sidecar extents then
+// return to independent free pools; coherence blocks are never freed alone.
 cl_status_t cl_mem_alloc(cl_runtime_t *runtime, size_t bytes, size_t alignment, cl_gptr_t *out_gptr);
 cl_status_t cl_mem_free(cl_runtime_t *runtime, cl_gptr_t gptr);
 

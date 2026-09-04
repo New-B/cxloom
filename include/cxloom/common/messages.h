@@ -17,6 +17,11 @@ enum class MessageKind : std::uint16_t {
     kBarrierRelease,
     kTokenReq,
     kTokenGrant,
+    kTokenReject,
+    kTokenCancel,
+    kTokenCancelAck,
+    kTokenRetire,
+    kTokenRetireAck,
     kLoadUpdate,
 };
 
@@ -62,7 +67,8 @@ struct BarrierRelease {
 struct TokenRequest {
     MessageHeader header {};
     GlobalPointer object {};
-    std::uint64_t generation {0};
+    std::uint64_t block_index {0};
+    std::uint64_t allocation_id {0};
     std::uint64_t request_id {0};
     Version observed_version {0};
     HostId requester {0};
@@ -72,12 +78,70 @@ struct TokenRequest {
 struct TokenGrant {
     MessageHeader header {};
     GlobalPointer object {};
-    std::uint64_t generation {0};
+    std::uint64_t block_index {0};
+    std::uint64_t allocation_id {0};
     std::uint64_t request_id {0};
     HostId new_owner {0};
     Version version {0};
     std::uint64_t token_epoch {0};
     bool activate_coherence_epoch {true};
+};
+
+enum class TokenCompletionReason : std::uint16_t {
+    kCancelled = 0,
+    kStaleAllocation,
+    kRetiring,
+    kInvalidBlock,
+    kInvalidMetadata,
+    kInternalFailure,
+    kTooLate,
+};
+
+struct TokenReject {
+    MessageHeader header {};
+    GlobalPointer object {};
+    std::uint64_t block_index {0};
+    std::uint64_t allocation_id {0};
+    std::uint64_t request_id {0};
+    HostId requester {0};
+    TokenCompletionReason reason {TokenCompletionReason::kInternalFailure};
+};
+
+struct TokenCancel {
+    MessageHeader header {};
+    GlobalPointer object {};
+    std::uint64_t block_index {0};
+    std::uint64_t allocation_id {0};
+    std::uint64_t request_id {0};
+    HostId requester {0};
+};
+
+struct TokenCancelAck {
+    MessageHeader header {};
+    GlobalPointer object {};
+    std::uint64_t block_index {0};
+    std::uint64_t allocation_id {0};
+    std::uint64_t request_id {0};
+    HostId requester {0};
+    TokenCompletionReason reason {TokenCompletionReason::kCancelled};
+};
+
+struct TokenRetire {
+    MessageHeader header {};
+    GlobalPointer object {};
+    std::uint64_t block_index {0};
+    std::uint64_t allocation_id {0};
+    std::uint64_t retirement_id {0};
+    HostId coordinator {0};
+};
+
+struct TokenRetireAck {
+    MessageHeader header {};
+    GlobalPointer object {};
+    std::uint64_t block_index {0};
+    std::uint64_t allocation_id {0};
+    std::uint64_t retirement_id {0};
+    HostId coordinator {0};
 };
 
 }  // namespace cxloom

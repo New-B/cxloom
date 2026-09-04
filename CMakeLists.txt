@@ -36,7 +36,10 @@ add_library(cxloom_loompar STATIC
 target_include_directories(cxloom_loompar PUBLIC include)
 target_link_libraries(cxloom_loompar PUBLIC cxloom_common cxloom_loommem)
 
-add_library(cxloom STATIC src/api/cxloom_mem.cpp)
+add_library(cxloom STATIC
+    src/api/cxloom_mem.cpp
+    src/api/loommem.cpp
+)
 target_include_directories(cxloom PUBLIC include)
 target_link_libraries(cxloom PUBLIC cxloom_loommem)
 
@@ -77,6 +80,10 @@ target_link_libraries(cxloom_cl_shared_mem_api_test PRIVATE cxloom)
 set_target_properties(cxloom_cl_shared_mem_api_test PROPERTIES LINKER_LANGUAGE CXX)
 add_test(NAME cxloom_cl_shared_mem_api_test COMMAND cxloom_cl_shared_mem_api_test)
 
+add_executable(cxloom_loommem_user_api_test tests/loommem_user_api_test.cpp)
+target_link_libraries(cxloom_loommem_user_api_test PRIVATE cxloom)
+add_test(NAME cxloom_loommem_user_api_test COMMAND cxloom_loommem_user_api_test)
+
 add_executable(cxloom_shared_region_test tests/shared_region_test.cpp)
 target_link_libraries(cxloom_shared_region_test PRIVATE cxloom_loommem)
 add_test(NAME cxloom_shared_region_test COMMAND cxloom_shared_region_test)
@@ -104,3 +111,7 @@ add_test(NAME cxloom_dynamic_host_count_test COMMAND cxloom_dynamic_host_count_t
 add_executable(cxloom_coherence_test tests/coherence_test.cpp)
 target_link_libraries(cxloom_coherence_test PRIVATE cxloom_loommem)
 add_test(NAME cxloom_coherence_test COMMAND cxloom_coherence_test)
+
+add_executable(cxloom_block_range_test tests/block_range_test.cpp)
+target_link_libraries(cxloom_block_range_test PRIVATE cxloom_loommem)
+add_test(NAME cxloom_block_range_test COMMAND cxloom_block_range_test)

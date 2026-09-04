@@ -143,10 +143,10 @@ int main() {
                                 received_by_owner.ok() && read_value(received_by_attacher.value()) == kOwnerValue &&
                                 read_value(received_by_owner.value()) == kAttacherValue;
 
-    const bool shared_free_is_deferred = !owner.FreeShared(owner_object.value()).ok();
+    const bool shared_free_succeeded = owner.FreeShared(owner_object.value()).ok();
 
     attacher.Finalize();
     owner.Finalize();
     std::remove(path);
-    return values_visible && queues_visible && shared_free_is_deferred ? 0 : 1;
+    return values_visible && queues_visible && shared_free_succeeded ? 0 : 1;
 }
