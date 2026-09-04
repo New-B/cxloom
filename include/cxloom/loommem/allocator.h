@@ -64,7 +64,7 @@ class SlabExtentAllocator final : public GlobalAllocator {
 
 inline constexpr std::uint64_t kAllocatorMagic = 0x43584c4f4f4d414cULL;
 inline constexpr std::uint64_t kAllocationMagic = 0x43584c4f4f4d4f42ULL;
-inline constexpr std::uint32_t kAllocatorLayoutVersion = 4;
+inline constexpr std::uint32_t kAllocatorLayoutVersion = 5;
 
 enum class AllocatorState : std::uint32_t {
     kUninitialized = 0,
@@ -100,6 +100,8 @@ struct alignas(64) AllocationDescriptor {
     std::atomic<std::uint32_t> token_owner {0};
     std::atomic<std::uint64_t> version {0};
     std::atomic<std::uint64_t> token_epoch {0};
+    // Even when shared data is stable; odd while the token holder may publish.
+    std::atomic<std::uint64_t> coherence_epoch {0};
 };
 
 struct alignas(64) AllocatorHeader {

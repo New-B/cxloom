@@ -125,6 +125,21 @@ per-pair capacity up to 1024 that fits all `N * (N - 1)` directed queues in the
 reserved queue region. Explicit capacities remain supported and are rejected
 if they do not fit.
 
+## Single-Writer/Multi-Reader Coherence
+
+`AcquireWriteBuffer` and `ReleaseWriteBuffer` combine token ownership with
+version publication. `AcquireReadSnapshot` maintains an immutable host-local
+replica and refreshes it when the shared version advances. A descriptor
+coherence epoch prevents readers from accepting a concurrent partial
+writeback. See `docs/cxl-coherence.md`.
+
+Run the variable-scale devdax validation with:
+
+```bash
+./scripts/launch-numa-containers.sh <host-count>
+./scripts/run-coherence-stress-containers.sh
+```
+
 ## Visibility and Ordering Litmus
 
 Run scripts/run-visibility-litmus-containers.sh after container launch to

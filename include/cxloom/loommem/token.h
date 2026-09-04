@@ -39,15 +39,18 @@ class TokenService {
                  TokenQueueResolver queue_resolver,
                  VisibilityMode mode = VisibilityMode::kReleaseAcquire);
 
-    Result<TokenRequestHandle> Request(GlobalPointer object);
+    Result<TokenRequestHandle> Request(GlobalPointer object, bool activate_coherence_epoch = true);
     Status RegisterAllocation(GlobalPointer object);
     Result<TokenLease> Wait(const TokenRequestHandle& request, std::uint64_t timeout_ms);
-    Status Release(const TokenLease& lease);
+    Status Cancel(const TokenRequestHandle& request);
+    Status BeginWriteback(const TokenLease& lease);
+    Status Release(const TokenLease& lease, bool modified = true);
     Status HandleMessage(const QueueEnvelope& envelope);
 
   private:
     struct Waiter {
         bool granted {false};
+        bool abandoned {false};
         TokenLease lease {};
         std::condition_variable ready;
     };
@@ -62,6 +65,7 @@ class TokenService {
     Status Grant(const TokenRequest& request, AllocationDescriptor* descriptor);
     Status HandleRequest(const TokenRequest& request);
     Status HandleGrant(const TokenGrant& grant);
+    Status ActivateWriter(AllocationDescriptor* descriptor);
     Status PushWithBackpressure(HostId destination, QueueEnvelope envelope);
 
     HostId local_host_ {0};

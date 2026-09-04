@@ -33,6 +33,10 @@ cxloom::CxloomConfig ToCppConfig(const cl_config_t& config) {
     if (config.bootstrap_timeout_ms != 0) {
         result.bootstrap_timeout_ms = config.bootstrap_timeout_ms;
     }
+    if (config.replica_cache_capacity_entries != 0)
+        result.replica_cache_capacity_entries = config.replica_cache_capacity_entries;
+    if (config.replica_cache_capacity_bytes != 0)
+        result.replica_cache_capacity_bytes = config.replica_cache_capacity_bytes;
     return result;
 }
 

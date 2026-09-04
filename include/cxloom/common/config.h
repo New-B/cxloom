@@ -20,6 +20,10 @@ struct CxloomConfig {
     // Zero selects the largest capacity up to 1024 that fits all directed
     // host-pair queues in the reserved queue region.
     std::size_t queue_capacity_entries {0};
+    // Host-local immutable replica cache limits. Snapshots retained by callers
+    // remain valid after their cache entry is evicted.
+    std::size_t replica_cache_capacity_entries {1024};
+    std::size_t replica_cache_capacity_bytes {64ULL << 20};
 
     // Empty selects a process-private anonymous mapping for unit tests.
     // A devdax path such as /dev/dax0.0 selects a shared CXL mapping.

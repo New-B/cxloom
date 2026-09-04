@@ -66,6 +66,7 @@ struct TokenRequest {
     std::uint64_t request_id {0};
     Version observed_version {0};
     HostId requester {0};
+    bool activate_coherence_epoch {true};
 };
 
 struct TokenGrant {
@@ -76,7 +77,7 @@ struct TokenGrant {
     HostId new_owner {0};
     Version version {0};
     std::uint64_t token_epoch {0};
+    bool activate_coherence_epoch {true};
 };
 
 }  // namespace cxloom
-

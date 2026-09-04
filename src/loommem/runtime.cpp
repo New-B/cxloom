@@ -169,6 +169,12 @@ Status LoomMemRuntime::Finalize() {
     const auto poller_status = StopQueuePoller();
     queue_poller_.reset();
     token_service_.reset();
+    {
+        std::lock_guard<std::mutex> lock(replicas_mutex_);
+        replicas_.clear();
+        cached_replica_bytes_ = 0;
+        replica_access_clock_ = 0;
+    }
     queues_.clear();
     coherence_.reset();
     allocator_.reset();
@@ -521,6 +527,159 @@ Status LoomMemRuntime::ReleaseWriteToken(const TokenLease& lease) {
     if (!initialized_ || token_service_ == nullptr)
         return Status::FailedPrecondition("write tokens require an initialized shared runtime");
     return token_service_->Release(lease);
+}
+
+Status LoomMemRuntime::CancelWriteTokenRequest(const TokenRequestHandle& request) {
+    if (!initialized_ || token_service_ == nullptr)
+        return Status::FailedPrecondition("write tokens require an initialized shared runtime");
+    return token_service_->Cancel(request);
+}
+
+std::size_t LoomMemRuntime::cached_replica_count() const {
+    std::lock_guard<std::mutex> lock(replicas_mutex_);
+    return replicas_.size();
+}
+
+std::size_t LoomMemRuntime::cached_replica_bytes() const {
+    std::lock_guard<std::mutex> lock(replicas_mutex_);
+    return cached_replica_bytes_;
+}
+
+void LoomMemRuntime::EvictReplicasLocked() {
+    while (replicas_.size() > config_.replica_cache_capacity_entries ||
+           cached_replica_bytes_ > config_.replica_cache_capacity_bytes) {
+        auto victim = replicas_.end();
+        for (auto candidate = replicas_.begin(); candidate != replicas_.end(); ++candidate) {
+            if (victim == replicas_.end() || candidate->second.last_access < victim->second.last_access)
+                victim = candidate;
+        }
+        if (victim == replicas_.end())
+            break;
+        cached_replica_bytes_ -= victim->second.storage->size();
+        replicas_.erase(victim);
+    }
+}
+
+void LoomMemRuntime::CacheReplica(std::uint64_t object_offset, std::uint64_t generation, Version version,
+                                  std::shared_ptr<const std::vector<std::byte>> storage) {
+    std::lock_guard<std::mutex> lock(replicas_mutex_);
+    const auto existing = replicas_.find(object_offset);
+    if (existing != replicas_.end()) {
+        cached_replica_bytes_ -= existing->second.storage->size();
+        replicas_.erase(existing);
+    }
+    cached_replica_bytes_ += storage->size();
+    replicas_.emplace(object_offset,
+                      CachedReplica {generation, version, std::move(storage), ++replica_access_clock_});
+    EvictReplicasLocked();
+}
+
+Result<ReadSnapshot> LoomMemRuntime::AcquireReadSnapshot(GlobalPointer object, std::uint64_t timeout_ms) {
+    if (!initialized_ || !region_mapper_.is_shared() || timeout_ms == 0)
+        return Status::FailedPrecondition("read snapshots require an initialized shared runtime and timeout");
+    auto* allocator = dynamic_cast<SharedBumpAllocator*>(allocator_.get());
+    if (allocator == nullptr)
+        return Status::FailedPrecondition("read snapshots require the shared allocator");
+    const auto descriptor_result = allocator->MutableDescriptor(object);
+    if (!descriptor_result.ok())
+        return descriptor_result.status();
+    auto* descriptor = descriptor_result.value();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto metadata_status = AcquireData(descriptor, sizeof(*descriptor), VisibilityMode::kReleaseAcquire);
+        if (!metadata_status.ok())
+            return metadata_status;
+        const auto epoch_before = descriptor->coherence_epoch.load(std::memory_order_acquire);
+        if ((epoch_before & 1U) != 0) {
+            std::this_thread::yield();
+            continue;
+        }
+        const auto version_before = descriptor->version.load(std::memory_order_acquire);
+        const auto generation = descriptor->generation;
+        {
+            std::lock_guard<std::mutex> lock(replicas_mutex_);
+            const auto cached = replicas_.find(object.offset);
+            if (cached != replicas_.end() && cached->second.generation == generation &&
+                cached->second.version == version_before) {
+                cached->second.last_access = ++replica_access_clock_;
+                return ReadSnapshot {object, version_before, cached->second.storage};
+            }
+        }
+
+        auto refreshed = std::make_shared<std::vector<std::byte>>(descriptor->bytes);
+        const auto data_status = AcquireData(static_cast<std::byte*>(region_mapper_.base()) + object.offset,
+                                             descriptor->bytes, VisibilityMode::kReleaseAcquire);
+        if (!data_status.ok())
+            return data_status;
+        std::memcpy(refreshed->data(), static_cast<std::byte*>(region_mapper_.base()) + object.offset,
+                    descriptor->bytes);
+        const auto verify_status = AcquireData(descriptor, sizeof(*descriptor), VisibilityMode::kReleaseAcquire);
+        if (!verify_status.ok())
+            return verify_status;
+        const auto epoch_after = descriptor->coherence_epoch.load(std::memory_order_acquire);
+        const auto version_after = descriptor->version.load(std::memory_order_acquire);
+        if (epoch_before != epoch_after || (epoch_after & 1U) != 0 || version_before != version_after ||
+            generation != descriptor->generation) {
+            std::this_thread::yield();
+            continue;
+        }
+        std::shared_ptr<const std::vector<std::byte>> immutable = std::move(refreshed);
+        CacheReplica(object.offset, generation, version_after, immutable);
+        return ReadSnapshot {object, version_after, std::move(immutable)};
+    }
+    return Status::Unavailable("timed out waiting for a stable readable object version");
+}
+
+Result<WriteBuffer> LoomMemRuntime::AcquireWriteBuffer(GlobalPointer object, std::uint64_t timeout_ms) {
+    if (!initialized_ || token_service_ == nullptr)
+        return Status::FailedPrecondition("write buffers require an initialized shared runtime");
+    // Buffered writers do not touch shared bytes until release, so holding the
+    // token alone must not make the last committed version unreadable.
+    const auto request = token_service_->Request(object, false);
+    if (!request.ok())
+        return request.status();
+    const auto lease = WaitForWriteToken(request.value(), timeout_ms);
+    if (!lease.ok()) {
+        CancelWriteTokenRequest(request.value());
+        return lease.status();
+    }
+    const auto allocation = DescribeSharedAllocation(object);
+    if (!allocation.ok()) {
+        token_service_->Release(lease.value(), false);
+        return allocation.status();
+    }
+    auto storage = std::make_shared<std::vector<std::byte>>(allocation.value().bytes);
+    const auto data_status = AcquireData(static_cast<std::byte*>(region_mapper_.base()) + object.offset,
+                                         allocation.value().bytes, VisibilityMode::kReleaseAcquire);
+    if (!data_status.ok()) {
+        token_service_->Release(lease.value(), false);
+        return data_status;
+    }
+    std::memcpy(storage->data(), static_cast<std::byte*>(region_mapper_.base()) + object.offset,
+                allocation.value().bytes);
+    return WriteBuffer {lease.value(), std::move(storage)};
+}
+
+Status LoomMemRuntime::ReleaseWriteBuffer(const WriteBuffer& write) {
+    if (!initialized_ || write.storage == nullptr)
+        return Status::FailedPrecondition("write buffer requires an initialized runtime and storage");
+    const auto allocation = DescribeSharedAllocation(write.lease.object);
+    if (!allocation.ok())
+        return allocation.status();
+    if (allocation.value().generation != write.lease.generation || allocation.value().bytes != write.storage->size())
+        return Status::FailedPrecondition("write buffer does not match the shared allocation");
+    const auto begin_status = token_service_->BeginWriteback(write.lease);
+    if (!begin_status.ok())
+        return begin_status;
+    std::memcpy(static_cast<std::byte*>(region_mapper_.base()) + write.lease.object.offset, write.storage->data(),
+                write.storage->size());
+    const auto release_status = ReleaseWriteToken(write.lease);
+    if (!release_status.ok())
+        return release_status;
+    std::shared_ptr<const std::vector<std::byte>> immutable =
+        std::make_shared<const std::vector<std::byte>>(*write.storage);
+    CacheReplica(write.lease.object.offset, write.lease.generation, write.lease.version + 1, immutable);
+    return Status::Ok();
 }
 
 Status LoomMemRuntime::InitializeBootstrap() {

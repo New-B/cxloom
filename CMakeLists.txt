@@ -58,6 +58,9 @@ target_link_libraries(cxloom_queue_transport PRIVATE cxloom_loommem)
 add_executable(cxloom_token_stress examples/token_stress_main.cpp)
 target_link_libraries(cxloom_token_stress PRIVATE cxloom_loommem)
 
+add_executable(cxloom_coherence_stress examples/coherence_stress_main.cpp)
+target_link_libraries(cxloom_coherence_stress PRIVATE cxloom_loommem)
+
 enable_testing()
 
 add_executable(cxloom_allocator_test tests/allocator_test.cpp)
@@ -97,3 +100,7 @@ add_test(NAME cxloom_token_test COMMAND cxloom_token_test)
 add_executable(cxloom_dynamic_host_count_test tests/dynamic_host_count_test.cpp)
 target_link_libraries(cxloom_dynamic_host_count_test PRIVATE cxloom_loommem)
 add_test(NAME cxloom_dynamic_host_count_test COMMAND cxloom_dynamic_host_count_test)
+
+add_executable(cxloom_coherence_test tests/coherence_test.cpp)
+target_link_libraries(cxloom_coherence_test PRIVATE cxloom_loommem)
+add_test(NAME cxloom_coherence_test COMMAND cxloom_coherence_test)

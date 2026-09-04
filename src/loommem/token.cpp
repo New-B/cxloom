@@ -47,7 +47,7 @@ Result<AllocationDescriptor*> TokenService::Descriptor(GlobalPointer object) con
     if (!descriptor.ok())
         return descriptor.status();
     if (!descriptor.value()->token_owner.is_lock_free() || !descriptor.value()->version.is_lock_free() ||
-        !descriptor.value()->token_epoch.is_lock_free())
+        !descriptor.value()->token_epoch.is_lock_free() || !descriptor.value()->coherence_epoch.is_lock_free())
         return Status::FailedPrecondition("token metadata requires lock-free shared atomics");
     return descriptor.value();
 }
@@ -88,7 +88,23 @@ Status TokenService::RegisterAllocation(GlobalPointer object) {
     return Status::Ok();
 }
 
-Result<TokenRequestHandle> TokenService::Request(GlobalPointer object) {
+Status TokenService::ActivateWriter(AllocationDescriptor* descriptor) {
+    auto epoch = descriptor->coherence_epoch.load(std::memory_order_acquire);
+    while ((epoch & 1U) == 0) {
+        if (descriptor->coherence_epoch.compare_exchange_weak(epoch, epoch + 1, std::memory_order_acq_rel,
+                                                               std::memory_order_acquire)) {
+            const auto status = PublishData(descriptor, sizeof(*descriptor), mode_);
+            if (!status.ok()) {
+                descriptor->coherence_epoch.store(epoch, std::memory_order_release);
+                return status;
+            }
+            return Status::Ok();
+        }
+    }
+    return Status::FailedPrecondition("another writer is already active for this object");
+}
+
+Result<TokenRequestHandle> TokenService::Request(GlobalPointer object, bool activate_coherence_epoch) {
     const auto descriptor = Descriptor(object);
     if (!descriptor.ok())
         return descriptor.status();
@@ -109,6 +125,7 @@ Result<TokenRequestHandle> TokenService::Request(GlobalPointer object) {
         request.request_id = request_id;
         request.observed_version = descriptor.value()->version.load(std::memory_order_acquire);
         request.requester = local_host_;
+        request.activate_coherence_epoch = activate_coherence_epoch;
 
         if (owner != local_host_) {
             const auto status = SendRequest(owner, request);
@@ -128,9 +145,15 @@ Result<TokenRequestHandle> TokenService::Request(GlobalPointer object) {
             state.pending.push_back(request);
         } else {
             state.held = true;
-            waiter->lease = {object,
-                             generation,
-                             descriptor.value()->version.load(std::memory_order_acquire),
+            if (activate_coherence_epoch) {
+                const auto activate_status = ActivateWriter(descriptor.value());
+                if (!activate_status.ok()) {
+                    state.held = false;
+                    waiters_.erase(request_id);
+                    return activate_status;
+                }
+            }
+            waiter->lease = {object, generation, descriptor.value()->version.load(std::memory_order_acquire),
                              descriptor.value()->token_epoch.load(std::memory_order_acquire)};
             waiter->granted = true;
             waiter->ready.notify_one();
@@ -152,21 +175,57 @@ Result<TokenLease> TokenService::Wait(const TokenRequestHandle& request, std::ui
     return lease;
 }
 
-Status TokenService::Grant(const TokenRequest& request, AllocationDescriptor* descriptor) {
-    if (request.requester == local_host_) {
+Status TokenService::Cancel(const TokenRequestHandle& request) {
+    TokenLease granted_lease;
+    bool release_grant = false;
+    {
         std::lock_guard<std::mutex> lock(mutex_);
         const auto found = waiters_.find(request.request_id);
         if (found == waiters_.end())
-            return Status::NotFound("local token requester no longer exists");
-        objects_[request.object.offset].held = true;
-        objects_[request.object.offset].available = true;
-        found->second->lease = {request.object,
-                                request.generation,
-                                descriptor->version.load(std::memory_order_acquire),
-                                descriptor->token_epoch.load(std::memory_order_acquire)};
-        found->second->granted = true;
-        found->second->ready.notify_one();
-        return Status::Ok();
+            return Status::NotFound("unknown token request handle");
+        if (!found->second->granted) {
+            found->second->abandoned = true;
+            return Status::Ok();
+        }
+        granted_lease = found->second->lease;
+        waiters_.erase(found);
+        release_grant = true;
+    }
+    return release_grant ? Release(granted_lease, false) : Status::Ok();
+}
+
+Status TokenService::Grant(const TokenRequest& request, AllocationDescriptor* descriptor) {
+    if (request.requester == local_host_) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (waiters_.find(request.request_id) == waiters_.end())
+                return Status::NotFound("local token requester no longer exists");
+        }
+        if (request.activate_coherence_epoch) {
+            const auto activate_status = ActivateWriter(descriptor);
+            if (!activate_status.ok())
+                return activate_status;
+        }
+        TokenLease lease {request.object, request.generation, descriptor->version.load(std::memory_order_acquire),
+                          descriptor->token_epoch.load(std::memory_order_acquire)};
+        bool abandoned = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            const auto found = waiters_.find(request.request_id);
+            if (found == waiters_.end())
+                return Status::NotFound("local token requester disappeared during grant");
+            objects_[request.object.offset].held = true;
+            objects_[request.object.offset].available = true;
+            abandoned = found->second->abandoned;
+            if (abandoned) {
+                waiters_.erase(found);
+            } else {
+                found->second->lease = lease;
+                found->second->granted = true;
+                found->second->ready.notify_one();
+            }
+        }
+        return abandoned ? Release(lease, false) : Status::Ok();
     }
 
     const auto epoch = descriptor->token_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -184,6 +243,7 @@ Status TokenService::Grant(const TokenRequest& request, AllocationDescriptor* de
     grant.new_owner = request.requester;
     grant.version = descriptor->version.load(std::memory_order_acquire);
     grant.token_epoch = epoch;
+    grant.activate_coherence_epoch = request.activate_coherence_epoch;
     const auto status = PushWithBackpressure(request.requester, Encode(grant));
     if (status.ok()) {
         std::deque<TokenRequest> remaining;
@@ -252,16 +312,35 @@ Status TokenService::HandleGrant(const TokenGrant& grant) {
         descriptor.value()->version.load(std::memory_order_acquire) != grant.version)
         return Status::FailedPrecondition("token grant does not match authoritative metadata");
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto found = waiters_.find(grant.request_id);
-    if (found == waiters_.end())
-        return Status::NotFound("token grant has no matching request");
-    objects_[grant.object.offset].held = true;
-    objects_[grant.object.offset].available = true;
-    found->second->lease = {grant.object, grant.generation, grant.version, grant.token_epoch};
-    found->second->granted = true;
-    found->second->ready.notify_one();
-    return Status::Ok();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (waiters_.find(grant.request_id) == waiters_.end())
+            return Status::NotFound("token grant has no matching request");
+    }
+    if (grant.activate_coherence_epoch) {
+        const auto activate_status = ActivateWriter(descriptor.value());
+        if (!activate_status.ok())
+            return activate_status;
+    }
+    const TokenLease lease {grant.object, grant.generation, grant.version, grant.token_epoch};
+    bool abandoned = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto found = waiters_.find(grant.request_id);
+        if (found == waiters_.end())
+            return Status::NotFound("token requester disappeared during grant");
+        objects_[grant.object.offset].held = true;
+        objects_[grant.object.offset].available = true;
+        abandoned = found->second->abandoned;
+        if (abandoned) {
+            waiters_.erase(found);
+        } else {
+            found->second->lease = lease;
+            found->second->granted = true;
+            found->second->ready.notify_one();
+        }
+    }
+    return abandoned ? Release(lease, false) : Status::Ok();
 }
 
 Status TokenService::HandleMessage(const QueueEnvelope& envelope) {
@@ -276,7 +355,24 @@ Status TokenService::HandleMessage(const QueueEnvelope& envelope) {
     return Status::InvalidArgument("message is not handled by the token service");
 }
 
-Status TokenService::Release(const TokenLease& lease) {
+Status TokenService::BeginWriteback(const TokenLease& lease) {
+    const auto descriptor = Descriptor(lease.object);
+    if (!descriptor.ok())
+        return descriptor.status();
+    if (descriptor.value()->generation != lease.generation ||
+        descriptor.value()->token_owner.load(std::memory_order_acquire) != local_host_ ||
+        descriptor.value()->token_epoch.load(std::memory_order_acquire) != lease.token_epoch)
+        return Status::FailedPrecondition("token lease is stale or not locally owned");
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto found = objects_.find(lease.object.offset);
+        if (found == objects_.end() || !found->second.held)
+            return Status::FailedPrecondition("token lease is not active in the local service");
+    }
+    return ActivateWriter(descriptor.value());
+}
+
+Status TokenService::Release(const TokenLease& lease, bool modified) {
     const auto descriptor = Descriptor(lease.object);
     if (!descriptor.ok())
         return descriptor.status();
@@ -292,10 +388,17 @@ Status TokenService::Release(const TokenLease& lease) {
             return Status::FailedPrecondition("token lease is not active in the local service");
     }
 
-    const auto data_status = PublishData(region_base_ + lease.object.offset, descriptor.value()->bytes, mode_);
-    if (!data_status.ok())
-        return data_status;
-    descriptor.value()->version.fetch_add(1, std::memory_order_acq_rel);
+    const auto coherence_epoch = descriptor.value()->coherence_epoch.load(std::memory_order_acquire);
+    if (modified && (coherence_epoch & 1U) == 0)
+        return Status::FailedPrecondition("modified release requires an active writeback epoch");
+    if (modified) {
+        const auto data_status = PublishData(region_base_ + lease.object.offset, descriptor.value()->bytes, mode_);
+        if (!data_status.ok())
+            return data_status;
+        descriptor.value()->version.fetch_add(1, std::memory_order_acq_rel);
+    }
+    if ((coherence_epoch & 1U) != 0)
+        descriptor.value()->coherence_epoch.store(coherence_epoch + 1, std::memory_order_release);
     const auto metadata_status = PublishData(descriptor.value(), sizeof(*descriptor.value()), mode_);
     if (!metadata_status.ok())
         return metadata_status;

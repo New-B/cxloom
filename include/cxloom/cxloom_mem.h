@@ -27,6 +27,9 @@ typedef struct {
     uint8_t create_region_file;
     uint16_t reserved0;
     uint64_t bootstrap_timeout_ms;
+    // Zero preserves the C++ runtime defaults.
+    size_t replica_cache_capacity_entries;
+    size_t replica_cache_capacity_bytes;
 } cl_config_t;
 
 typedef enum {

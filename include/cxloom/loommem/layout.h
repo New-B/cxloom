@@ -32,7 +32,7 @@ struct SharedRegionLayout {
 };
 
 inline constexpr std::uint64_t kBootstrapMagic = 0x43584c4f4f4d424dULL; // "CXLOOMBM"
-inline constexpr std::uint32_t kBootstrapLayoutVersion = 5;
+inline constexpr std::uint32_t kBootstrapLayoutVersion = 6;
 
 enum class BootstrapState : std::uint32_t {
     kUninitialized = 0,

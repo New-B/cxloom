@@ -132,7 +132,10 @@ Progress:
 - two-host integration coverage validates bidirectional handoff, publication, and stale-lease rejection
 - container and runtime initialization now derive queue topology and capacity from a 1..64 host count
 - variable-scale token and all-pairs queue tests validate non-fixed host counts
-- local replica metadata and reader refresh remain to complete this phase
+- immutable host-local replicas are cached by allocation generation and version
+- readers refresh with an even/odd coherence epoch that rejects concurrent partial writeback
+- write buffers integrate token acquisition, data publication, version increment, and cache update
+- multi-runtime and variable-scale devdax tests cover single-writer/multi-reader refresh
 
 Exit criteria:
 
