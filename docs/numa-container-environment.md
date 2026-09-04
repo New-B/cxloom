@@ -41,9 +41,7 @@ therefore mount `run/cxl-shared` at `/cxloom-shared` and export
 
 The launcher now passes `/dev/dax0.0` through and exports `CL_DAX_DEVICE` plus
 `CL_BOOTSTRAP_OWNER`. Applications must pass these values into `cl_config_t`.
-LoomMem can map the DAX device and establish its shared bootstrap header, but
-allocator metadata and queues remain process-local. Cross-container allocation,
-queue transport, and coherence are therefore not available yet.
+LoomMem maps the DAX device, establishes its shared bootstrap header, and initializes one global append-only allocation pool. Shared free/reuse, queue transport, and coherence are not available yet.
 
 After launching containers, verify the real DAX mapping and bootstrap protocol:
 
@@ -72,6 +70,4 @@ Use the following test for the initial multi-host LoomMem system bring-up:
 ```
 
 Unlike the older sequential mapping check, this keeps all logical hosts alive
-concurrently. Host zero initializes a fresh DAX bootstrap header, each host
-registers and publishes a per-host probe, and every host waits for and validates
-all configured peers.
+concurrently. Host zero initializes a fresh DAX bootstrap and shared allocator header. Each host allocates and publishes an object from the common pool; every host then checks that allocations do not overlap and validates all peer object contents.

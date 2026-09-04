@@ -20,6 +20,7 @@ add_library(cxloom_loommem STATIC
     src/loommem/queue.cpp
     src/loommem/region_mapper.cpp
     src/loommem/runtime.cpp
+    src/loommem/visibility.cpp
 )
 target_include_directories(cxloom_loommem PUBLIC include)
 target_link_libraries(cxloom_loommem PUBLIC cxloom_common)
@@ -46,6 +47,9 @@ target_link_libraries(cxloom_dax_bootstrap PRIVATE cxloom_loommem)
 add_executable(cxloom_host_init examples/host_init_main.cpp)
 target_link_libraries(cxloom_host_init PRIVATE cxloom_loommem)
 
+add_executable(cxloom_visibility_litmus examples/visibility_litmus_main.cpp)
+target_link_libraries(cxloom_visibility_litmus PRIVATE cxloom_loommem)
+
 enable_testing()
 
 add_executable(cxloom_allocator_test tests/allocator_test.cpp)
@@ -57,6 +61,15 @@ target_link_libraries(cxloom_cl_mem_api_test PRIVATE cxloom)
 set_target_properties(cxloom_cl_mem_api_test PROPERTIES LINKER_LANGUAGE CXX)
 add_test(NAME cxloom_cl_mem_api_test COMMAND cxloom_cl_mem_api_test)
 
+add_executable(cxloom_cl_shared_mem_api_test tests/cl_shared_mem_api_test.c)
+target_link_libraries(cxloom_cl_shared_mem_api_test PRIVATE cxloom)
+set_target_properties(cxloom_cl_shared_mem_api_test PROPERTIES LINKER_LANGUAGE CXX)
+add_test(NAME cxloom_cl_shared_mem_api_test COMMAND cxloom_cl_shared_mem_api_test)
+
 add_executable(cxloom_shared_region_test tests/shared_region_test.cpp)
 target_link_libraries(cxloom_shared_region_test PRIVATE cxloom_loommem)
 add_test(NAME cxloom_shared_region_test COMMAND cxloom_shared_region_test)
+
+add_executable(cxloom_visibility_test tests/visibility_test.cpp)
+target_link_libraries(cxloom_visibility_test PRIVATE cxloom_loommem)
+add_test(NAME cxloom_visibility_test COMMAND cxloom_visibility_test)

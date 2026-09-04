@@ -28,7 +28,8 @@ done
 
 start_host() {
     local host_id="$1"
-    docker exec "cxloom-h${host_id}" /tmp/cxloom-build/cxloom_host_init         >"/tmp/cxloom-host-init-${host_id}.log" 2>&1 &
+    docker exec "cxloom-h${host_id}" /tmp/cxloom-build/cxloom_host_init \
+        >"/tmp/cxloom-host-init-${host_id}.log" 2>&1 &
     last_pid=$!
 }
 

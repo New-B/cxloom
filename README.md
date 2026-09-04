@@ -72,6 +72,26 @@ After launching the containers, run a concurrent shared-DAX initialization test:
 ./scripts/run-host-init-containers.sh 16
 ```
 
-Host zero creates a fresh bootstrap session. Every host then registers in its
-own shared cache-line slot, publishes a probe through `/dev/dax0.0`, waits for
-all configured hosts, and validates every peer's probe.
+Host zero creates a fresh bootstrap session and initializes one global append-only allocation pool. All hosts allocate from the same atomic bump cursor, publish one object, and then validate that every published range is non-overlapping and readable through each local mapping.
+
+## Shared Allocator V1
+
+For a shared DAX mapping, the bootstrap owner formats an allocator header in
+the allocator region. Every host reserves space from one global atomic bump
+cursor. A self-describing metadata prefix is stored immediately before each
+aligned object and records its offset, size, alignment, owner, allocation ID,
+and generation.
+
+Shared allocation count has no per-host descriptor limit and is bounded only by
+the shared-data pool capacity. Allocations are append-only: cl_mem_free returns CL_UNIMPLEMENTED for a DAX-backed runtime.
+ResolveLocal accepts only published allocation base pointers in shared mode;
+arbitrary offsets and interior pointers are rejected. The bootstrap object's
+publication slots are bring-up/test coordination and are not a general-purpose
+object directory.
+
+## Visibility and Ordering Litmus
+
+Run scripts/run-visibility-litmus-containers.sh after container launch to
+compare release, sequentially consistent, CLFLUSH+MFENCE, and CLWB+SFENCE publication/acquisition recipes. See docs/visibility-ordering-litmus.md for the protocol and
+interpretation rules. Only real /dev/dax0.0 results should determine the
+runtime's eventual publication recipe.

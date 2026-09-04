@@ -89,15 +89,17 @@ Goal:
 
 Tasks:
 
-1. implement global extent allocation
-2. assign per-host extent ownership
-3. add host-local suballocation fast paths
-4. reserve metadata for deallocation and reuse
+1. initialize an append-only global shared-data pool
+2. reserve aligned object space with a shared atomic cursor
+3. store allocation metadata inline before each object
+4. validate and resolve allocation-base GPtrs across hosts
+5. reserve future metadata semantics for deallocation and reuse
 
 Exit criteria:
 
-- shared objects can be allocated and referenced by `GPtr`
-- fast-path allocation does not require global synchronization on every request
+- shared objects can be allocated and referenced by GPtr
+- allocation capacity is bounded by the global pool rather than a per-host quota
+- allocation descriptors can be queried from every host
 
 ## Phase 5: LoomMem Coherence V1
 
@@ -209,3 +211,14 @@ If we use the current repository skeleton, the best next implementation order is
 8. `src/loompar/scheduler.cpp`
 
 That order keeps the control plane from getting ahead of the data-plane guarantees it depends on.
+
+## Current Shared Allocator V1 Boundary
+
+The initial Phase 4 slice now uses owner-formatted allocator metadata in the
+shared CXL region. It provides a global atomic bump pool, stable offset-based global pointers, inline allocation descriptors without a per-host record limit, allocation and owner lookup, and multi-host read-only bring-up tests.
+
+This V1 is intentionally append-only. Reclamation, generation reuse, remote
+lifetime tracking, and a general object directory remain future work. The next
+platform step after validating this allocator on real devdax is the now-available visibility
+and ordering litmus suite used to replace generic C++ release/acquire
+assumptions with a measured CXL publication recipe.

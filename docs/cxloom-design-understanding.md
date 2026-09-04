@@ -219,13 +219,7 @@ Candidates include:
 
 The design currently leans toward block/object-granular coherence, with `4KB` as a practical V1 starting point.
 
-Allocator design should be separated from coherence-token design:
-
-- use global extent allocation
-- give each host ownership of large extents
-- perform host-local suballocation inside owned extents
-
-This avoids a global lock on every `cxl_malloc()`.
+Allocator design is separated from coherence-token design. The bring-up allocator uses one global atomic bump cursor and stores a self-describing allocation prefix immediately before every object. This removes per-host capacity and descriptor-count limits, at the cost of one shared CAS per allocation. A later scalable allocator may reserve chunks from the global pool and suballocate locally without changing the GlobalPointer contract.
 
 ## 4. LoomPar: What LeoPar Contributes
 
@@ -442,7 +436,7 @@ The two documents together suggest a realistic first implementation target:
 - multi-NUMA logical-host emulation on one machine
 - shared CXL region abstraction
 - global offset-based addressing
-- global allocator + per-host extents
+- global append-only allocator with inline allocation descriptors
 - host-local replica cache
 - dynamic token ownership per block
 - version-based reader freshness

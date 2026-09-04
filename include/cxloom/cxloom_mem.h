@@ -18,6 +18,7 @@ typedef struct {
     uint16_t local_host_id;
     uint16_t host_count;
     size_t shared_region_bytes;
+    // Legacy process-private placement hint; ignored by the shared allocator.
     size_t per_host_extent_bytes;
     size_t coherence_granule_bytes;
     size_t queue_capacity_entries;
@@ -43,7 +44,8 @@ typedef enum {
 cl_status_t cl_runtime_create(const cl_config_t *config, cl_runtime_t **runtime);
 void cl_runtime_destroy(cl_runtime_t *runtime);
 
-// Allocates and releases an object from the shared CXL data region.
+// Allocates an object from the shared CXL data region. Shared DAX allocations
+// use a global append-only pool and cannot yet be freed or reused.
 cl_status_t cl_mem_alloc(cl_runtime_t *runtime, size_t bytes, size_t alignment, cl_gptr_t *out_gptr);
 cl_status_t cl_mem_free(cl_runtime_t *runtime, cl_gptr_t gptr);
 

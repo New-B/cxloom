@@ -14,6 +14,7 @@ struct CxloomConfig {
     std::uint16_t host_count {1};
 
     std::size_t shared_region_bytes {1ULL << 30};
+    // Legacy process-private placement heuristic; ignored by the shared global allocator.
     std::size_t per_host_extent_bytes {1ULL << 28};
     std::size_t coherence_granule_bytes {4096};
     std::size_t queue_capacity_entries {1024};
@@ -32,7 +33,7 @@ struct CxloomConfig {
 };
 
 class ConfigValidator {
-public:
+  public:
     static Status Validate(const CxloomConfig& config);
 };
 

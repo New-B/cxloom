@@ -31,8 +31,8 @@ struct SharedRegionLayout {
     RegionRange shared_data {};
 };
 
-inline constexpr std::uint64_t kBootstrapMagic = 0x43584c4f4f4d424dULL;  // "CXLOOMBM"
-inline constexpr std::uint32_t kBootstrapLayoutVersion = 2;
+inline constexpr std::uint64_t kBootstrapMagic = 0x43584c4f4f4d424dULL; // "CXLOOMBM"
+inline constexpr std::uint32_t kBootstrapLayoutVersion = 3;
 
 enum class BootstrapState : std::uint32_t {
     kUninitialized = 0,
@@ -45,12 +45,18 @@ enum class HostRegistrationState : std::uint32_t {
     kEmpty = 0,
     kJoined = 1,
     kProbeReady = 2,
+    kObjectReady = 3,
 };
 
 struct alignas(64) HostRegistration {
     std::atomic<std::uint32_t> state {static_cast<std::uint32_t>(HostRegistrationState::kEmpty)};
     std::uint32_t reserved {0};
     std::atomic<std::uint64_t> probe_value {0};
+    std::atomic<std::uint64_t> object_offset {0};
+    std::atomic<std::uint64_t> object_bytes {0};
+    std::atomic<std::uint64_t> published_sequence {0};
+    std::atomic<std::uint64_t> observed_sequence {0};
+    std::atomic<std::uint64_t> visibility_errors {0};
 };
 
 // Resides at offset zero of every shared CXL region. Fields are intentionally

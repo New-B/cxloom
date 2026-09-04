@@ -67,19 +67,36 @@ Status LoomMemRuntime::Initialize() {
         return bootstrap_status;
     }
 
-    const auto registration_status = RegisterLocalHost();
-    if (!registration_status.ok()) {
-        bootstrap_ = nullptr;
-        region_mapper_.Unmap();
-        return registration_status;
-    }
+    allocator_header_ =
+        reinterpret_cast<AllocatorHeader*>(static_cast<std::byte*>(region_mapper_.base()) + layout_.allocator.offset);
 
-    allocator_ = std::make_unique<SlabExtentAllocator>(layout_.shared_data.bytes);
+    if (region_mapper_.is_shared()) {
+        allocator_ = std::make_unique<SharedBumpAllocator>(allocator_header_, region_mapper_.base(),
+                                                           region_mapper_.bytes(), config_.local_host_id,
+                                                           layout_.shared_data.offset, layout_.shared_data.bytes);
+    } else {
+        allocator_ = std::make_unique<SlabExtentAllocator>(layout_.shared_data.bytes);
+    }
     coherence_ = std::make_unique<TokenCoherenceManager>(config_.local_host_id);
 
     auto init_status = allocator_->Initialize();
     if (!init_status.ok()) {
+        coherence_.reset();
+        allocator_.reset();
+        allocator_header_ = nullptr;
+        bootstrap_ = nullptr;
+        region_mapper_.Unmap();
         return init_status;
+    }
+
+    const auto registration_status = RegisterLocalHost();
+    if (!registration_status.ok()) {
+        coherence_.reset();
+        allocator_.reset();
+        allocator_header_ = nullptr;
+        bootstrap_ = nullptr;
+        region_mapper_.Unmap();
+        return registration_status;
     }
 
     queues_.clear();
@@ -92,8 +109,7 @@ Status LoomMemRuntime::Initialize() {
     }
 
     initialized_ = true;
-    Trace("loommem", region_mapper_.is_shared() ? "initialized shared CXL region" :
-                                                 "initialized private test region");
+    Trace("loommem", region_mapper_.is_shared() ? "initialized shared CXL region" : "initialized private test region");
     return Status::Ok();
 }
 
@@ -103,6 +119,7 @@ Status LoomMemRuntime::Finalize() {
     coherence_.reset();
     allocator_.reset();
     bootstrap_ = nullptr;
+    allocator_header_ = nullptr;
     const auto unmap_status = region_mapper_.Unmap();
     if (!unmap_status.ok()) {
         return unmap_status;
@@ -114,14 +131,13 @@ Result<GlobalPointer> LoomMemRuntime::AllocateShared(std::size_t bytes, std::siz
     if (!initialized_) {
         return Status::FailedPrecondition("LoomMem runtime must be initialized before allocation");
     }
-    if (region_mapper_.is_shared()) {
-        return Status::Unimplemented("shared allocator metadata is not implemented yet");
-    }
     auto result = allocator_->Allocate(bytes, alignment);
     if (!result.ok()) {
         return result.status();
     }
-    result.value().offset += layout_.shared_data.offset;
+    if (!region_mapper_.is_shared()) {
+        result.value().offset += layout_.shared_data.offset;
+    }
     return result.value();
 }
 
@@ -129,14 +145,13 @@ Status LoomMemRuntime::FreeShared(GlobalPointer gptr) {
     if (!initialized_) {
         return Status::FailedPrecondition("LoomMem runtime must be initialized before free");
     }
-    if (region_mapper_.is_shared()) {
-        return Status::Unimplemented("shared allocator metadata is not implemented yet");
-    }
     if (gptr.region_id != 0 || gptr.offset < layout_.shared_data.offset ||
         gptr.offset >= layout_.shared_data.offset + layout_.shared_data.bytes) {
         return Status::InvalidArgument("global pointer does not refer to the shared-data region");
     }
-    gptr.offset -= layout_.shared_data.offset;
+    if (!region_mapper_.is_shared()) {
+        gptr.offset -= layout_.shared_data.offset;
+    }
     return allocator_->Free(gptr);
 }
 
@@ -144,15 +159,42 @@ Result<void*> LoomMemRuntime::ResolveLocal(const GlobalPointer& gptr) const {
     if (!initialized_) {
         return Status::FailedPrecondition("LoomMem runtime must be initialized before address resolution");
     }
-    if (gptr.region_id != 0 || gptr.offset >= region_mapper_.bytes()) {
+    if (gptr.region_id != 0 || gptr.offset < layout_.shared_data.offset ||
+        gptr.offset >= layout_.shared_data.offset + layout_.shared_data.bytes) {
         return Status::InvalidArgument("global pointer is outside the mapped shared region");
+    }
+    if (region_mapper_.is_shared()) {
+        const auto allocation = DescribeSharedAllocation(gptr);
+        if (!allocation.ok())
+            return allocation.status();
     }
     auto* base = static_cast<std::byte*>(region_mapper_.base());
     return base + gptr.offset;
 }
 
+Result<AllocationInfo> LoomMemRuntime::DescribeSharedAllocation(GlobalPointer gptr) const {
+    if (!initialized_)
+        return Status::FailedPrecondition("runtime is not initialized");
+    const auto* allocator = dynamic_cast<const SharedBumpAllocator*>(allocator_.get());
+    if (allocator == nullptr) {
+        return Status::FailedPrecondition("allocation descriptors require a shared runtime");
+    }
+    return allocator->Describe(gptr);
+}
+
+Result<HostId> LoomMemRuntime::ResolveOwningHost(GlobalPointer gptr) const {
+    if (!initialized_)
+        return Status::FailedPrecondition("runtime is not initialized");
+    const auto* allocator = dynamic_cast<const SharedBumpAllocator*>(allocator_.get());
+    if (allocator == nullptr) {
+        return Status::FailedPrecondition("allocation ownership requires a shared runtime");
+    }
+    return allocator->OwningHost(gptr);
+}
+
 Status LoomMemRuntime::PublishBootstrapProbe(std::uint64_t value) {
-    if (!initialized_ || bootstrap_ == nullptr) return Status::FailedPrecondition("runtime is not initialized");
+    if (!initialized_ || bootstrap_ == nullptr)
+        return Status::FailedPrecondition("runtime is not initialized");
     auto& host = bootstrap_->hosts[config_.local_host_id];
     host.probe_value.store(value, std::memory_order_relaxed);
     host.state.store(static_cast<std::uint32_t>(HostRegistrationState::kProbeReady), std::memory_order_release);
@@ -160,25 +202,35 @@ Status LoomMemRuntime::PublishBootstrapProbe(std::uint64_t value) {
 }
 
 Status LoomMemRuntime::WaitForAllHosts(std::uint64_t timeout_ms) const {
-    if (!initialized_ || bootstrap_ == nullptr) return Status::FailedPrecondition("runtime is not initialized");
+    if (!initialized_ || bootstrap_ == nullptr)
+        return Status::FailedPrecondition("runtime is not initialized");
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     while (std::chrono::steady_clock::now() < deadline) {
         bool ready = true;
         for (HostId host = 0; host < config_.host_count; ++host) {
-            const auto state = static_cast<HostRegistrationState>(bootstrap_->hosts[host].state.load(std::memory_order_acquire));
-            if (state != HostRegistrationState::kProbeReady) { ready = false; break; }
+            const auto state =
+                static_cast<HostRegistrationState>(bootstrap_->hosts[host].state.load(std::memory_order_acquire));
+            if (state < HostRegistrationState::kProbeReady) {
+                ready = false;
+                break;
+            }
         }
-        if (ready) return Status::Ok();
+        if (ready)
+            return Status::Ok();
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     return Status::Unavailable("timed out waiting for all hosts to publish bootstrap probes");
 }
 
 Result<std::uint64_t> LoomMemRuntime::ReadBootstrapProbe(HostId host) const {
-    if (!initialized_ || bootstrap_ == nullptr) return Status::FailedPrecondition("runtime is not initialized");
-    if (host >= config_.host_count) return Status::InvalidArgument("probe host is out of range");
-    const auto state = static_cast<HostRegistrationState>(bootstrap_->hosts[host].state.load(std::memory_order_acquire));
-    if (state != HostRegistrationState::kProbeReady) return Status::Unavailable("host probe is not ready");
+    if (!initialized_ || bootstrap_ == nullptr)
+        return Status::FailedPrecondition("runtime is not initialized");
+    if (host >= config_.host_count)
+        return Status::InvalidArgument("probe host is out of range");
+    const auto state =
+        static_cast<HostRegistrationState>(bootstrap_->hosts[host].state.load(std::memory_order_acquire));
+    if (state < HostRegistrationState::kProbeReady)
+        return Status::Unavailable("host probe is not ready");
     return bootstrap_->hosts[host].probe_value.load(std::memory_order_relaxed);
 }
 
@@ -186,11 +238,164 @@ std::uint32_t LoomMemRuntime::joined_host_count() const {
     return bootstrap_ == nullptr ? 0 : bootstrap_->joined_hosts.load(std::memory_order_acquire);
 }
 
-Result<HostId> LoomMemRuntime::ResolvePreferredHost(const GlobalPointer& gptr) const {
-    if (config_.host_count == 0) {
-        return Status::FailedPrecondition("host_count is zero");
+Status LoomMemRuntime::PublishSharedObject(GlobalPointer gptr, std::uint64_t bytes, VisibilityMode mode) {
+    if (!initialized_ || bootstrap_ == nullptr || allocator_header_ == nullptr) {
+        return Status::FailedPrecondition("runtime is not initialized");
     }
-    return static_cast<HostId>((gptr.offset / config_.per_host_extent_bytes) % config_.host_count);
+    if (bytes == 0 || gptr.region_id != 0 || gptr.offset > region_mapper_.bytes() ||
+        bytes > region_mapper_.bytes() - gptr.offset) {
+        return Status::InvalidArgument("published object is outside the mapped region");
+    }
+    const auto allocation = DescribeSharedAllocation(gptr);
+    if (!allocation.ok())
+        return allocation.status();
+    if (allocation.value().owner_host != config_.local_host_id || bytes > allocation.value().bytes) {
+        return Status::InvalidArgument("published object is not owned by the local host allocation");
+    }
+    auto* descriptor = static_cast<std::byte*>(region_mapper_.base()) + gptr.offset - sizeof(AllocationDescriptor);
+    const auto descriptor_status = PublishData(descriptor, sizeof(AllocationDescriptor), mode);
+    if (!descriptor_status.ok())
+        return descriptor_status;
+
+    auto& host = bootstrap_->hosts[config_.local_host_id];
+    host.object_offset.store(gptr.offset, std::memory_order_relaxed);
+    host.object_bytes.store(bytes, std::memory_order_relaxed);
+    host.state.store(static_cast<std::uint32_t>(HostRegistrationState::kObjectReady), std::memory_order_release);
+    return PublishData(&host, sizeof(host), mode);
+}
+
+Status LoomMemRuntime::WaitForAllSharedObjects(std::uint64_t timeout_ms, VisibilityMode mode) const {
+    if (!initialized_ || bootstrap_ == nullptr) {
+        return Status::FailedPrecondition("runtime is not initialized");
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+        bool ready = true;
+        for (HostId host = 0; host < config_.host_count; ++host) {
+            auto& registration = bootstrap_->hosts[host];
+            const auto acquire_status = AcquireData(&registration, sizeof(registration), mode);
+            if (!acquire_status.ok())
+                return acquire_status;
+            const auto state = static_cast<HostRegistrationState>(registration.state.load(std::memory_order_acquire));
+            if (state != HostRegistrationState::kObjectReady) {
+                ready = false;
+                break;
+            }
+        }
+        if (ready)
+            return Status::Ok();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return Status::Unavailable("timed out waiting for all hosts to publish shared objects");
+}
+
+Result<PublishedSharedObject> LoomMemRuntime::ReadPublishedSharedObject(HostId host) const {
+    if (!initialized_ || bootstrap_ == nullptr) {
+        return Status::FailedPrecondition("runtime is not initialized");
+    }
+    if (host >= config_.host_count)
+        return Status::InvalidArgument("published-object host is out of range");
+    const auto& registration = bootstrap_->hosts[host];
+    const auto state = static_cast<HostRegistrationState>(registration.state.load(std::memory_order_acquire));
+    if (state != HostRegistrationState::kObjectReady) {
+        return Status::Unavailable("host shared object is not ready");
+    }
+    return PublishedSharedObject {GlobalPointer {0, registration.object_offset.load(std::memory_order_relaxed)},
+                                  registration.object_bytes.load(std::memory_order_relaxed)};
+}
+
+Status LoomMemRuntime::PublishVisibilitySequence(std::uint64_t sequence, VisibilityMode mode) {
+    if (!initialized_ || bootstrap_ == nullptr || sequence == 0) {
+        return Status::FailedPrecondition("runtime and non-zero sequence are required");
+    }
+    auto& host = bootstrap_->hosts[config_.local_host_id];
+    const auto state = static_cast<HostRegistrationState>(host.state.load(std::memory_order_acquire));
+    if (state != HostRegistrationState::kObjectReady) {
+        return Status::FailedPrecondition("shared object must be published before visibility iterations");
+    }
+    host.published_sequence.store(sequence, std::memory_order_release);
+    return PublishData(&host.published_sequence, sizeof(host.published_sequence), mode);
+}
+
+Status LoomMemRuntime::WaitForVisibilitySequence(std::uint64_t sequence, std::uint64_t timeout_ms,
+                                                       VisibilityMode mode) const {
+    if (!initialized_ || bootstrap_ == nullptr)
+        return Status::FailedPrecondition("runtime is not initialized");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+        bool ready = true;
+        for (HostId host = 0; host < config_.host_count; ++host) {
+            auto& published = bootstrap_->hosts[host].published_sequence;
+            const auto acquire_status = AcquireData(&published, sizeof(published), mode);
+            if (!acquire_status.ok())
+                return acquire_status;
+            if (published.load(std::memory_order_acquire) < sequence) {
+                ready = false;
+                break;
+            }
+        }
+        if (ready)
+            return Status::Ok();
+        std::this_thread::yield();
+    }
+    return Status::Unavailable("timed out waiting for visibility publication sequence");
+}
+
+Status LoomMemRuntime::PublishObservedSequence(std::uint64_t sequence, std::uint64_t errors, VisibilityMode mode) {
+    if (!initialized_ || bootstrap_ == nullptr || sequence == 0) {
+        return Status::FailedPrecondition("runtime and non-zero sequence are required");
+    }
+    auto& host = bootstrap_->hosts[config_.local_host_id];
+    host.visibility_errors.store(errors, std::memory_order_relaxed);
+    host.observed_sequence.store(sequence, std::memory_order_release);
+    return PublishData(&host.observed_sequence, sizeof(host.observed_sequence), mode);
+}
+
+Status LoomMemRuntime::WaitForObservedSequence(std::uint64_t sequence, std::uint64_t timeout_ms,
+                                                     VisibilityMode mode) const {
+    if (!initialized_ || bootstrap_ == nullptr)
+        return Status::FailedPrecondition("runtime is not initialized");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+        bool ready = true;
+        for (HostId host = 0; host < config_.host_count; ++host) {
+            auto& observed = bootstrap_->hosts[host].observed_sequence;
+            const auto acquire_status = AcquireData(&observed, sizeof(observed), mode);
+            if (!acquire_status.ok())
+                return acquire_status;
+            if (observed.load(std::memory_order_acquire) < sequence) {
+                ready = false;
+                break;
+            }
+        }
+        if (ready)
+            return Status::Ok();
+        std::this_thread::yield();
+    }
+    return Status::Unavailable("timed out waiting for visibility observation sequence");
+}
+
+std::uint64_t LoomMemRuntime::visibility_error_count() const {
+    if (!initialized_ || bootstrap_ == nullptr)
+        return 0;
+    std::uint64_t errors = 0;
+    for (HostId host = 0; host < config_.host_count; ++host) {
+        bootstrap_->hosts[host].observed_sequence.load(std::memory_order_acquire);
+        errors += bootstrap_->hosts[host].visibility_errors.load(std::memory_order_relaxed);
+    }
+    return errors;
+}
+
+Result<HostId> LoomMemRuntime::ResolvePreferredHost(const GlobalPointer& gptr) const {
+    if (config_.host_count == 0)
+        return Status::FailedPrecondition("host_count is zero");
+    if (region_mapper_.is_shared())
+        return ResolveOwningHost(gptr);
+    if (gptr.offset < layout_.shared_data.offset) {
+        return Status::InvalidArgument("global pointer is outside the shared-data region");
+    }
+    return static_cast<HostId>(((gptr.offset - layout_.shared_data.offset) / config_.per_host_extent_bytes) %
+                               config_.host_count);
 }
 
 Result<SpscQueue*> LoomMemRuntime::GetQueue(HostId producer, HostId consumer) {
@@ -210,13 +415,20 @@ Status LoomMemRuntime::InitializeBootstrap() {
     bootstrap_->region_bytes = config_.shared_region_bytes;
     bootstrap_->host_count = config_.host_count;
     bootstrap_->layout = layout_;
+    auto* allocator_header =
+        reinterpret_cast<AllocatorHeader*>(static_cast<std::byte*>(region_mapper_.base()) + layout_.allocator.offset);
+    const auto allocator_status = FormatSharedAllocator(allocator_header, layout_.allocator.bytes,
+                                                        layout_.shared_data.offset, layout_.shared_data.bytes);
+    if (!allocator_status.ok()) {
+        bootstrap_->state.store(static_cast<std::uint32_t>(BootstrapState::kFailed), std::memory_order_release);
+        return allocator_status;
+    }
     bootstrap_->state.store(static_cast<std::uint32_t>(BootstrapState::kReady), std::memory_order_release);
     return Status::Ok();
 }
 
 Status LoomMemRuntime::AttachBootstrap() {
-    const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::milliseconds(config_.bootstrap_timeout_ms);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(config_.bootstrap_timeout_ms);
     while (std::chrono::steady_clock::now() < deadline) {
         const auto state = static_cast<BootstrapState>(bootstrap_->state.load(std::memory_order_acquire));
         if (state == BootstrapState::kReady) {
@@ -252,7 +464,9 @@ Status LoomMemRuntime::ValidateBootstrap(const BootstrapHeader& header) const {
 Status LoomMemRuntime::RegisterLocalHost() {
     auto& registration = bootstrap_->hosts[config_.local_host_id];
     std::uint32_t expected = static_cast<std::uint32_t>(HostRegistrationState::kEmpty);
-    if (!registration.state.compare_exchange_strong(expected, static_cast<std::uint32_t>(HostRegistrationState::kJoined), std::memory_order_acq_rel, std::memory_order_acquire)) {
+    if (!registration.state.compare_exchange_strong(expected,
+                                                    static_cast<std::uint32_t>(HostRegistrationState::kJoined),
+                                                    std::memory_order_acq_rel, std::memory_order_acquire)) {
         return Status::AlreadyExists("local host id is already registered in this bootstrap session");
     }
     bootstrap_->joined_hosts.fetch_add(1, std::memory_order_acq_rel);

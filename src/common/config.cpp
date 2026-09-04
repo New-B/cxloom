@@ -14,8 +14,8 @@ Status ConfigValidator::Validate(const CxloomConfig& config) {
     if (config.host_count > kMaxHosts) {
         return Status::InvalidArgument("host_count exceeds the bootstrap host table capacity");
     }
-    if (config.shared_region_bytes == 0 || config.per_host_extent_bytes == 0) {
-        return Status::InvalidArgument("shared region and extent sizes must be non-zero");
+    if (config.shared_region_bytes == 0) {
+        return Status::InvalidArgument("shared region size must be non-zero");
     }
     if (config.coherence_granule_bytes == 0) {
         return Status::InvalidArgument("coherence_granule_bytes must be non-zero");

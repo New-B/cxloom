@@ -47,4 +47,3 @@ inline bool operator==(const GlobalThreadId& lhs, const GlobalThreadId& rhs) {
 }
 
 }  // namespace cxloom
-
