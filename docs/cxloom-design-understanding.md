@@ -182,9 +182,12 @@ CXL should carry:
 - thread lifecycle control
 - barrier control traffic
 
-The preferred control primitive is:
+The control primitive is:
 
-- per-host-pair `CXL-resident SPSC queues`
+- one directed `CXL-resident SPSC queue` per distinct host pair
+- producer and consumer cursors on separate single-writer cache lines
+- fixed inline control payloads, with larger data referenced through GPtr
+- one CPU-bound consumer poller per host with rotating scans and bounded batch drains
 
 Reason:
 

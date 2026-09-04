@@ -81,6 +81,14 @@ Exit criteria:
 - one host can reliably send and receive control messages through shared CXL memory
 - queue correctness does not depend on cross-host CAS-heavy structures
 
+Current status:
+
+- implemented one CXL-resident SPSC ring per directed non-self host pair
+- separated producer tail and consumer head into single-writer cache lines
+- added fixed slots, sequence validation, backpressure, endpoint checks, and visibility-profile integration
+- added a CPU-bound round-robin poller with batch drain, adaptive backoff, dispatch callbacks, and runtime lifecycle management
+- validated all 12 directed queues with four NUMA-pinned hosts on `/dev/dax0.0`
+
 ## Phase 4: LoomMem Allocator and Global Addressing
 
 Goal:

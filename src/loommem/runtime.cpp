@@ -70,6 +70,16 @@ Status LoomMemRuntime::Initialize() {
     allocator_header_ =
         reinterpret_cast<AllocatorHeader*>(static_cast<std::byte*>(region_mapper_.base()) + layout_.allocator.offset);
 
+    auto* queue_region = static_cast<std::byte*>(region_mapper_.base()) + layout_.queues.offset;
+    const auto queue_region_status =
+        ValidateSharedQueueRegion(queue_region, layout_.queues.bytes, config_.host_count, config_.queue_capacity_entries);
+    if (!queue_region_status.ok()) {
+        allocator_header_ = nullptr;
+        bootstrap_ = nullptr;
+        region_mapper_.Unmap();
+        return queue_region_status;
+    }
+
     if (region_mapper_.is_shared()) {
         allocator_ = std::make_unique<SharedBumpAllocator>(allocator_header_, region_mapper_.base(),
                                                            region_mapper_.bytes(), config_.local_host_id,
@@ -101,10 +111,24 @@ Status LoomMemRuntime::Initialize() {
 
     queues_.clear();
     queues_.resize(config_.host_count);
-    for (std::size_t producer = 0; producer < config_.host_count; ++producer) {
+    for (HostId producer = 0; producer < config_.host_count; ++producer) {
         queues_[producer].reserve(config_.host_count);
-        for (std::size_t consumer = 0; consumer < config_.host_count; ++consumer) {
-            queues_[producer].push_back(std::make_unique<SpscQueue>(config_.queue_capacity_entries));
+        for (HostId consumer = 0; consumer < config_.host_count; ++consumer) {
+            if (producer == consumer) {
+                queues_[producer].push_back(nullptr);
+                continue;
+            }
+            const auto storage = LocateSharedQueue(queue_region, layout_.queues.bytes, producer, consumer);
+            if (!storage.ok()) {
+                queues_.clear();
+                coherence_.reset();
+                allocator_.reset();
+                allocator_header_ = nullptr;
+                bootstrap_ = nullptr;
+                region_mapper_.Unmap();
+                return storage.status();
+            }
+            queues_[producer].push_back(std::make_unique<SpscQueue>(storage.value(), config_.local_host_id));
         }
     }
 
@@ -115,6 +139,8 @@ Status LoomMemRuntime::Initialize() {
 
 Status LoomMemRuntime::Finalize() {
     initialized_ = false;
+    const auto poller_status = StopQueuePoller();
+    queue_poller_.reset();
     queues_.clear();
     coherence_.reset();
     allocator_.reset();
@@ -124,7 +150,7 @@ Status LoomMemRuntime::Finalize() {
     if (!unmap_status.ok()) {
         return unmap_status;
     }
-    return Status::Ok();
+    return poller_status;
 }
 
 Result<GlobalPointer> LoomMemRuntime::AllocateShared(std::size_t bytes, std::size_t alignment) {
@@ -402,7 +428,36 @@ Result<SpscQueue*> LoomMemRuntime::GetQueue(HostId producer, HostId consumer) {
     if (producer >= config_.host_count || consumer >= config_.host_count) {
         return Status::InvalidArgument("queue endpoint is out of range");
     }
+    if (producer == consumer) {
+        return Status::InvalidArgument("self-pairs do not use the shared queue transport");
+    }
     return queues_[producer][consumer].get();
+}
+
+Status LoomMemRuntime::StartQueuePoller(QueueMessageHandler handler, QueuePollerOptions options) {
+    if (!initialized_)
+        return Status::FailedPrecondition("runtime must be initialized before starting the queue poller");
+    if (queue_poller_ != nullptr)
+        return Status::AlreadyExists("runtime already owns a queue poller");
+
+    std::vector<SpscQueue*> inbound_queues;
+    inbound_queues.reserve(config_.host_count > 0 ? config_.host_count - 1 : 0);
+    for (HostId producer = 0; producer < config_.host_count; ++producer) {
+        if (producer != config_.local_host_id)
+            inbound_queues.push_back(queues_[producer][config_.local_host_id].get());
+    }
+    queue_poller_ =
+        std::make_unique<QueuePoller>(config_.local_host_id, std::move(inbound_queues), std::move(handler), options);
+    const auto status = queue_poller_->Start();
+    if (!status.ok())
+        queue_poller_.reset();
+    return status;
+}
+
+Status LoomMemRuntime::StopQueuePoller() {
+    if (queue_poller_ == nullptr)
+        return Status::Ok();
+    return queue_poller_->Stop();
 }
 
 Status LoomMemRuntime::InitializeBootstrap() {
@@ -422,6 +477,13 @@ Status LoomMemRuntime::InitializeBootstrap() {
     if (!allocator_status.ok()) {
         bootstrap_->state.store(static_cast<std::uint32_t>(BootstrapState::kFailed), std::memory_order_release);
         return allocator_status;
+    }
+    auto* queue_region = static_cast<std::byte*>(region_mapper_.base()) + layout_.queues.offset;
+    const auto queue_status = FormatSharedQueueRegion(queue_region, layout_.queues.bytes, config_.host_count,
+                                                      config_.queue_capacity_entries);
+    if (!queue_status.ok()) {
+        bootstrap_->state.store(static_cast<std::uint32_t>(BootstrapState::kFailed), std::memory_order_release);
+        return queue_status;
     }
     bootstrap_->state.store(static_cast<std::uint32_t>(BootstrapState::kReady), std::memory_order_release);
     return Status::Ok();

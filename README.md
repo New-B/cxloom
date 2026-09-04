@@ -89,6 +89,19 @@ arbitrary offsets and interior pointers are rejected. The bootstrap object's
 publication slots are bring-up/test coordination and are not a general-purpose
 object directory.
 
+## CXL-Resident SPSC Queue Transport
+
+Every directed pair of distinct hosts owns one fixed-capacity ring in the
+shared CXL queue region. Each host can run a CPU-bound round-robin poller with
+batched draining and adaptive idle backoff. Run the four-host all-pairs transport test with:
+
+```bash
+./scripts/run-queue-transport-containers.sh
+```
+
+See `docs/cxl-spsc-queue.md` for the shared layout, ordering protocol, capacity
+constraints, and measured results.
+
 ## Visibility and Ordering Litmus
 
 Run scripts/run-visibility-litmus-containers.sh after container launch to

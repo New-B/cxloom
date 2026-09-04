@@ -181,7 +181,6 @@ Status FormatSharedAllocator(AllocatorHeader* header, std::size_t allocator_regi
     if (shared_data_bytes <= sizeof(AllocationDescriptor)) {
         return Status::InvalidArgument("shared data region is too small for allocations");
     }
-    std::memset(header, 0, sizeof(AllocatorHeader));
     header = new (header) AllocatorHeader();
     header->state.store(static_cast<std::uint32_t>(AllocatorState::kInitializing), std::memory_order_relaxed);
     header->magic = kAllocatorMagic;

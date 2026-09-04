@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <cstring>
 #include <cstdio>
 #include <unistd.h>
 
@@ -103,10 +104,49 @@ int main() {
     const bool values_visible = *static_cast<std::uint64_t*>(owner_from_attacher.value()) == kOwnerValue &&
                                 *static_cast<std::uint64_t*>(attacher_from_owner.value()) == kAttacherValue;
 
+    const auto owner_to_attacher = owner.GetQueue(0, 1);
+    const auto owner_to_attacher_remote = attacher.GetQueue(0, 1);
+    const auto attacher_to_owner = attacher.GetQueue(1, 0);
+    const auto attacher_to_owner_remote = owner.GetQueue(1, 0);
+    if (!owner_to_attacher.ok() || !owner_to_attacher_remote.ok() || !attacher_to_owner.ok() ||
+        !attacher_to_owner_remote.ok() || owner.GetQueue(0, 0).ok()) {
+        attacher.Finalize();
+        owner.Finalize();
+        std::remove(path);
+        return 1;
+    }
+
+    auto make_message = [](cxloom::HostId source, cxloom::HostId destination, std::uint64_t value) {
+        cxloom::loommem::QueueEnvelope message;
+        message.header.kind = cxloom::MessageKind::kTokenReq;
+        message.header.src_host = source;
+        message.header.dst_host = destination;
+        message.header.payload_bytes = sizeof(value);
+        message.payload.resize(sizeof(value));
+        std::memcpy(message.payload.data(), &value, sizeof(value));
+        return message;
+    };
+    auto read_value = [](const cxloom::loommem::QueueEnvelope& message) {
+        std::uint64_t value = 0;
+        std::memcpy(&value, message.payload.data(), sizeof(value));
+        return value;
+    };
+
+    const bool endpoint_permissions = !owner_to_attacher.value()->Pop().ok() &&
+                                      !owner_to_attacher_remote.value()->Push(make_message(0, 1, 0)).ok();
+    auto status = owner_to_attacher.value()->Push(make_message(0, 1, kOwnerValue));
+    const auto received_by_attacher = owner_to_attacher_remote.value()->Pop();
+    if (status.ok())
+        status = attacher_to_owner.value()->Push(make_message(1, 0, kAttacherValue));
+    const auto received_by_owner = attacher_to_owner_remote.value()->Pop();
+    const bool queues_visible = endpoint_permissions && status.ok() && received_by_attacher.ok() &&
+                                received_by_owner.ok() && read_value(received_by_attacher.value()) == kOwnerValue &&
+                                read_value(received_by_owner.value()) == kAttacherValue;
+
     const bool shared_free_is_deferred = !owner.FreeShared(owner_object.value()).ok();
 
     attacher.Finalize();
     owner.Finalize();
     std::remove(path);
-    return values_visible && shared_free_is_deferred ? 0 : 1;
+    return values_visible && queues_visible && shared_free_is_deferred ? 0 : 1;
 }
