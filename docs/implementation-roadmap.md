@@ -124,6 +124,14 @@ Tasks:
 5. implement release-side publish ordering
 6. integrate token and queue messaging
 
+Progress:
+
+- allocation descriptors now hold the authoritative token owner, version, and epoch
+- token request, grant, forwarding, pending arbitration, and release handoff run over the SPSC queues
+- the runtime poller dispatches token control messages before optional application messages
+- two-host integration coverage validates bidirectional handoff, publication, and stale-lease rejection
+- local replica metadata and reader refresh remain to complete this phase
+
 Exit criteria:
 
 - one writer at a time is enforced

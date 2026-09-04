@@ -36,8 +36,8 @@ int main() {
     if (!shared_allocator.Initialize().ok())
         return 1;
 
-    const auto whole_extent = shared_allocator.Allocate(4032, 64);
-    if (!whole_extent.ok() || whole_extent.value().offset != 4160 || shared_allocator.Allocate(1, 1).ok()) {
+    const auto whole_extent = shared_allocator.Allocate(3968, 64);
+    if (!whole_extent.ok() || whole_extent.value().offset != 4224 || shared_allocator.Allocate(1, 1).ok()) {
         std::cerr << "shared allocator did not enforce its extent boundary\n";
         return 1;
     }

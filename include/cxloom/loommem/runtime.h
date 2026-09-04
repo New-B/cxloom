@@ -10,6 +10,7 @@
 #include "cxloom/loommem/poller.h"
 #include "cxloom/loommem/queue.h"
 #include "cxloom/loommem/region_mapper.h"
+#include "cxloom/loommem/token.h"
 #include "cxloom/loommem/visibility.h"
 
 namespace cxloom::loommem {
@@ -51,8 +52,11 @@ class LoomMemRuntime {
     std::uint64_t visibility_error_count() const;
     Result<HostId> ResolvePreferredHost(const GlobalPointer& gptr) const;
     Result<SpscQueue*> GetQueue(HostId producer, HostId consumer);
-    Status StartQueuePoller(QueueMessageHandler handler, QueuePollerOptions options = {});
+    Status StartQueuePoller(QueueMessageHandler handler = {}, QueuePollerOptions options = {});
     Status StopQueuePoller();
+    Result<TokenRequestHandle> RequestWriteToken(GlobalPointer object);
+    Result<TokenLease> WaitForWriteToken(const TokenRequestHandle& request, std::uint64_t timeout_ms);
+    Status ReleaseWriteToken(const TokenLease& lease);
     const QueuePoller* queue_poller() const { return queue_poller_.get(); }
     const RegionMapper& region_mapper() const { return region_mapper_; }
 
@@ -66,6 +70,7 @@ class LoomMemRuntime {
     std::unique_ptr<CoherenceManager> coherence_;
     std::vector<std::vector<std::unique_ptr<SpscQueue>>> queues_;
     std::unique_ptr<QueuePoller> queue_poller_;
+    std::unique_ptr<TokenService> token_service_;
     bool initialized_ {false};
 
     Status InitializeBootstrap();

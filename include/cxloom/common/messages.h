@@ -61,15 +61,21 @@ struct BarrierRelease {
 
 struct TokenRequest {
     MessageHeader header {};
-    ObjectId object_id {0};
+    GlobalPointer object {};
+    std::uint64_t generation {0};
+    std::uint64_t request_id {0};
+    Version observed_version {0};
     HostId requester {0};
 };
 
 struct TokenGrant {
     MessageHeader header {};
-    ObjectId object_id {0};
+    GlobalPointer object {};
+    std::uint64_t generation {0};
+    std::uint64_t request_id {0};
     HostId new_owner {0};
     Version version {0};
+    std::uint64_t token_epoch {0};
 };
 
 }  // namespace cxloom

@@ -64,7 +64,7 @@ class SlabExtentAllocator final : public GlobalAllocator {
 
 inline constexpr std::uint64_t kAllocatorMagic = 0x43584c4f4f4d414cULL;
 inline constexpr std::uint64_t kAllocationMagic = 0x43584c4f4f4d4f42ULL;
-inline constexpr std::uint32_t kAllocatorLayoutVersion = 3;
+inline constexpr std::uint32_t kAllocatorLayoutVersion = 4;
 
 enum class AllocatorState : std::uint32_t {
     kUninitialized = 0,
@@ -97,6 +97,9 @@ struct alignas(64) AllocationDescriptor {
     std::uint64_t bytes {0};
     std::uint64_t alignment {0};
     std::uint64_t generation {0};
+    std::atomic<std::uint32_t> token_owner {0};
+    std::atomic<std::uint64_t> version {0};
+    std::atomic<std::uint64_t> token_epoch {0};
 };
 
 struct alignas(64) AllocatorHeader {
@@ -124,6 +127,7 @@ class SharedBumpAllocator final : public GlobalAllocator {
     Status Free(GlobalPointer gptr) override;
     Result<AllocationInfo> Describe(GlobalPointer gptr) const;
     Result<HostId> OwningHost(GlobalPointer gptr) const;
+    Result<AllocationDescriptor*> MutableDescriptor(GlobalPointer gptr) const;
 
   private:
     AllocatorHeader* header_ {nullptr};

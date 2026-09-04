@@ -132,6 +132,13 @@ Status LoomMemRuntime::Initialize() {
         }
     }
 
+    if (region_mapper_.is_shared()) {
+        auto* shared_allocator = dynamic_cast<SharedBumpAllocator*>(allocator_.get());
+        token_service_ = std::make_unique<TokenService>(
+            config_.local_host_id, shared_allocator, region_mapper_.base(),
+            [this](HostId producer, HostId consumer) { return GetQueue(producer, consumer); });
+    }
+
     initialized_ = true;
     Trace("loommem", region_mapper_.is_shared() ? "initialized shared CXL region" : "initialized private test region");
     return Status::Ok();
@@ -141,6 +148,7 @@ Status LoomMemRuntime::Finalize() {
     initialized_ = false;
     const auto poller_status = StopQueuePoller();
     queue_poller_.reset();
+    token_service_.reset();
     queues_.clear();
     coherence_.reset();
     allocator_.reset();
@@ -163,6 +171,10 @@ Result<GlobalPointer> LoomMemRuntime::AllocateShared(std::size_t bytes, std::siz
     }
     if (!region_mapper_.is_shared()) {
         result.value().offset += layout_.shared_data.offset;
+    } else if (token_service_ != nullptr) {
+        const auto token_status = token_service_->RegisterAllocation(result.value());
+        if (!token_status.ok())
+            return token_status;
     }
     return result.value();
 }
@@ -446,8 +458,18 @@ Status LoomMemRuntime::StartQueuePoller(QueueMessageHandler handler, QueuePoller
         if (producer != config_.local_host_id)
             inbound_queues.push_back(queues_[producer][config_.local_host_id].get());
     }
-    queue_poller_ =
-        std::make_unique<QueuePoller>(config_.local_host_id, std::move(inbound_queues), std::move(handler), options);
+    auto dispatch = [this, application_handler = std::move(handler)](QueueEnvelope message) mutable {
+        if (message.header.kind == MessageKind::kTokenReq || message.header.kind == MessageKind::kTokenGrant) {
+            if (token_service_ == nullptr)
+                return Status::FailedPrecondition("token message received without a token service");
+            return token_service_->HandleMessage(message);
+        }
+        if (!application_handler)
+            return Status::InvalidArgument("no handler is registered for this queue message kind");
+        return application_handler(std::move(message));
+    };
+    queue_poller_ = std::make_unique<QueuePoller>(config_.local_host_id, std::move(inbound_queues),
+                                                  std::move(dispatch), options);
     const auto status = queue_poller_->Start();
     if (!status.ok())
         queue_poller_.reset();
@@ -458,6 +480,27 @@ Status LoomMemRuntime::StopQueuePoller() {
     if (queue_poller_ == nullptr)
         return Status::Ok();
     return queue_poller_->Stop();
+}
+
+Result<TokenRequestHandle> LoomMemRuntime::RequestWriteToken(GlobalPointer object) {
+    if (!initialized_ || token_service_ == nullptr)
+        return Status::FailedPrecondition("write tokens require an initialized shared runtime");
+    if (queue_poller_ == nullptr || !queue_poller_->running())
+        return Status::FailedPrecondition("write tokens require a running queue poller");
+    return token_service_->Request(object);
+}
+
+Result<TokenLease> LoomMemRuntime::WaitForWriteToken(const TokenRequestHandle& request,
+                                                     std::uint64_t timeout_ms) {
+    if (!initialized_ || token_service_ == nullptr)
+        return Status::FailedPrecondition("write tokens require an initialized shared runtime");
+    return token_service_->Wait(request, timeout_ms);
+}
+
+Status LoomMemRuntime::ReleaseWriteToken(const TokenLease& lease) {
+    if (!initialized_ || token_service_ == nullptr)
+        return Status::FailedPrecondition("write tokens require an initialized shared runtime");
+    return token_service_->Release(lease);
 }
 
 Status LoomMemRuntime::InitializeBootstrap() {

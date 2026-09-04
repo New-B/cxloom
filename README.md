@@ -102,6 +102,14 @@ batched draining and adaptive idle backoff. Run the four-host all-pairs transpor
 See `docs/cxl-spsc-queue.md` for the shared layout, ordering protocol, capacity
 constraints, and measured results.
 
+## Queue-Based Write Tokens
+
+Shared allocations carry an authoritative owner, version, and token epoch.
+`RequestWriteToken`, `WaitForWriteToken`, and `ReleaseWriteToken` use the
+host-pair queues and the dedicated poller to serialize writers and publish data
+before ownership transfer. See `docs/cxl-token-protocol.md` for the state
+machine and cross-queue ordering rules.
+
 ## Visibility and Ordering Litmus
 
 Run scripts/run-visibility-litmus-containers.sh after container launch to

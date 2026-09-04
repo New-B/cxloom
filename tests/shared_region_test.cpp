@@ -118,7 +118,7 @@ int main() {
 
     auto make_message = [](cxloom::HostId source, cxloom::HostId destination, std::uint64_t value) {
         cxloom::loommem::QueueEnvelope message;
-        message.header.kind = cxloom::MessageKind::kTokenReq;
+        message.header.kind = cxloom::MessageKind::kLoadUpdate;
         message.header.src_host = source;
         message.header.dst_host = destination;
         message.header.payload_bytes = sizeof(value);

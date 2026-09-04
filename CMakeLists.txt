@@ -18,6 +18,7 @@ add_library(cxloom_loommem STATIC
     src/loommem/allocator.cpp
     src/loommem/coherence.cpp
     src/loommem/poller.cpp
+    src/loommem/token.cpp
     src/loommem/queue.cpp
     src/loommem/region_mapper.cpp
     src/loommem/runtime.cpp
@@ -85,3 +86,7 @@ add_test(NAME cxloom_queue_test COMMAND cxloom_queue_test)
 add_executable(cxloom_poller_test tests/poller_test.cpp)
 target_link_libraries(cxloom_poller_test PRIVATE cxloom_loommem)
 add_test(NAME cxloom_poller_test COMMAND cxloom_poller_test)
+
+add_executable(cxloom_token_test tests/token_test.cpp)
+target_link_libraries(cxloom_token_test PRIVATE cxloom_loommem)
+add_test(NAME cxloom_token_test COMMAND cxloom_token_test)

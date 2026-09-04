@@ -259,6 +259,9 @@ Result<GlobalPointer> SharedBumpAllocator::Allocate(std::size_t bytes, std::size
     descriptor->bytes = bytes;
     descriptor->alignment = alignment;
     descriptor->generation = 1;
+    descriptor->token_owner.store(local_host_, std::memory_order_relaxed);
+    descriptor->version.store(0, std::memory_order_relaxed);
+    descriptor->token_epoch.store(1, std::memory_order_relaxed);
     descriptor->state.store(static_cast<std::uint32_t>(AllocationState::kAllocated), std::memory_order_release);
     return GlobalPointer {0, object_offset};
 }
@@ -288,6 +291,13 @@ Result<AllocationInfo> SharedBumpAllocator::Describe(GlobalPointer gptr) const {
                            descriptor->owner_host,
                            descriptor->allocation_id,
                            descriptor->generation};
+}
+
+Result<AllocationDescriptor*> SharedBumpAllocator::MutableDescriptor(GlobalPointer gptr) const {
+    const auto allocation = Describe(gptr);
+    if (!allocation.ok())
+        return allocation.status();
+    return reinterpret_cast<AllocationDescriptor*>(region_base_ + gptr.offset - sizeof(AllocationDescriptor));
 }
 
 Result<HostId> SharedBumpAllocator::OwningHost(GlobalPointer gptr) const {
