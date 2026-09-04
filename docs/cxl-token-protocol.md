@@ -51,3 +51,25 @@ Token APIs require a shared runtime and a running poller.
 cxloom_token_test maps two runtimes to the same backing file and covers a
 blocked remote request, both handoff directions, data visibility, monotonic
 version/epoch changes, wait timeout reuse, and stale-lease rejection.
+
+## Variable-scale stress results
+
+The CXL/devdax stress test runs 2 to 64 NUMA-pinned containers contending for one
+shared object. Each acquired lease verifies the previous checksum, mutates the
+object, and releases the token. The final owner checks the exact counter and
+version against `host_count * iterations`.
+
+During initial testing this exposed an orphaned-request bug: after granting the
+first pending request, the old owner retained the rest of its local pending
+queue even though ownership had moved. The handoff now forwards the remaining
+requests to the new owner. Per-destination outbound mutexes also preserve the
+single-producer property when application and poller threads send concurrently.
+
+Pass the scale once when launching containers. Later test scripts discover the
+persisted `CL_HOST_COUNT` from container zero when neither a positional argument
+nor an environment override is supplied:
+
+```bash
+./scripts/launch-numa-containers.sh 12
+./scripts/run-token-stress-containers.sh
+```

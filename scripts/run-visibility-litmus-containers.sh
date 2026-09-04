@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONTAINER_COUNT="${1:-4}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/host-count.sh"
+CONTAINER_COUNT="$(cxloom_resolve_host_count "${1:-}")"
 VISIBILITY_MODES="${CL_VISIBILITY_MODES:-release seq_cst clflush clwb}"
 ITERATIONS="${CL_VISIBILITY_ITERATIONS:-1000}"
 
@@ -36,7 +38,7 @@ run_mode() {
     local pids=()
     local log_prefix="/tmp/cxloom-litmus-${mode}"
 
-    docker exec --env "CL_VISIBILITY_MODE=${mode}"         --env "CL_VISIBILITY_ITERATIONS=${ITERATIONS}"         cxloom-h0 /tmp/cxloom-build/cxloom_visibility_litmus         >"${log_prefix}-0.log" 2>&1 &
+    docker exec --env "CL_HOST_COUNT=${CONTAINER_COUNT}" --env "CL_VISIBILITY_MODE=${mode}"         --env "CL_VISIBILITY_ITERATIONS=${ITERATIONS}"         cxloom-h0 /tmp/cxloom-build/cxloom_visibility_litmus         >"${log_prefix}-0.log" 2>&1 &
     pids+=("$!")
 
     local owner_ready=0
@@ -56,7 +58,7 @@ run_mode() {
     fi
 
     for ((host_id = 1; host_id < CONTAINER_COUNT; ++host_id)); do
-        docker exec --env "CL_VISIBILITY_MODE=${mode}"             --env "CL_VISIBILITY_ITERATIONS=${ITERATIONS}"             "cxloom-h${host_id}" /tmp/cxloom-build/cxloom_visibility_litmus             >"${log_prefix}-${host_id}.log" 2>&1 &
+        docker exec --env "CL_HOST_COUNT=${CONTAINER_COUNT}" --env "CL_VISIBILITY_MODE=${mode}"             --env "CL_VISIBILITY_ITERATIONS=${ITERATIONS}"             "cxloom-h${host_id}" /tmp/cxloom-build/cxloom_visibility_litmus             >"${log_prefix}-${host_id}.log" 2>&1 &
         pids+=("$!")
     done
 

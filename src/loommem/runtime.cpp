@@ -1,5 +1,6 @@
 #include "cxloom/loommem/runtime.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <new>
@@ -38,6 +39,19 @@ bool SameLayout(const SharedRegionLayout& lhs, const SharedRegionLayout& rhs) {
            SameRange(lhs.shared_data, rhs.shared_data);
 }
 
+Result<std::size_t> AutomaticQueueCapacity(std::uint16_t host_count, std::uint64_t region_bytes) {
+    if (host_count <= 1)
+        return std::size_t {1};
+    const auto queue_count = static_cast<std::uint64_t>(host_count) * (host_count - 1);
+    if (region_bytes <= sizeof(QueueRegionHeader) ||
+        (region_bytes - sizeof(QueueRegionHeader)) / queue_count <= sizeof(SharedSpscQueueHeader))
+        return Status::InvalidArgument("queue region cannot hold one queue for every directed host pair");
+    const auto capacity = ((region_bytes - sizeof(QueueRegionHeader)) / queue_count -
+                           sizeof(SharedSpscQueueHeader)) /
+                          sizeof(SharedSpscQueueSlot);
+    return static_cast<std::size_t>(std::min<std::uint64_t>(capacity, 1024));
+}
+
 }  // namespace
 
 LoomMemRuntime::LoomMemRuntime(CxloomConfig config) : config_(std::move(config)) {}
@@ -51,6 +65,12 @@ Status LoomMemRuntime::Initialize() {
     layout_ = BuildDefaultLayout(config_.shared_region_bytes);
     if (layout_.shared_data.bytes == 0 || layout_.bootstrap.bytes < sizeof(BootstrapHeader)) {
         return Status::InvalidArgument("shared_region_bytes is too small for the LoomMem layout");
+    }
+    if (config_.queue_capacity_entries == 0) {
+        const auto capacity = AutomaticQueueCapacity(config_.host_count, layout_.queues.bytes);
+        if (!capacity.ok())
+            return capacity.status();
+        config_.queue_capacity_entries = capacity.value();
     }
 
     const auto map_status = region_mapper_.Map(config_);

@@ -1,8 +1,14 @@
 # CXL-Resident Host-Pair SPSC Queues
 
 The LoomMem control plane uses one ring for every directed pair of distinct
-hosts. A four-host deployment therefore has 12 independent queues. Self-pairs
-stay on the local runtime path and do not consume shared queue space.
+hosts. Self-pairs stay on the local runtime path and do not consume shared
+queue space.
+
+The implementation is not limited to four hosts. For `N` configured hosts it
+creates `N * (N - 1)` directed queues. A zero `queue_capacity_entries` selects
+the largest per-queue capacity up to 1024 that fits the fixed queue region, so
+increasing host count automatically trades queue depth for more host pairs.
+An explicit capacity is still validated against the available region.
 
 ## Shared layout
 
@@ -59,26 +65,11 @@ permissions, full/empty backpressure, wrap-around, sequence ordering, and
 messages in both directions through two independently mapped views of one
 shared backing file.
 
-For the four-host devdax transport test, launch four containers and run:
+For a variable-scale devdax transport test, launch the requested containers and run:
 
-    ./scripts/run-queue-transport-containers.sh
+    ./scripts/run-queue-transport-containers.sh [host-count]
 
 A longer or shorter run can be selected with:
 
     CL_QUEUE_ITERATIONS=1000000 CL_QUEUE_BATCH_SIZE=32 \
-    ./scripts/run-queue-transport-containers.sh
-
-## Measured platform result (2026-09-04)
-
-Four processes pinned to NUMA nodes 0 through 3 mapped `/dev/dax0.0`. Every
-host sent one message to and received one message from each of its three peers
-per iteration, exercising all 12 directed rings concurrently.
-
-- 1,000 iterations: zero errors on every host.
-- 100,000 iterations: zero errors on every host.
-- The original synchronous main-thread push/pop loop completed 600,000 operations per host in approximately 570 ms.
-- The dedicated poller with batch size 32 completed the same operation count in approximately 313-314 ms, with zero errors.
-
-This validates the transport on the current CPU-cache-coherent CXL emulation
-platform. A physically non-coherent multi-host platform must rerun the test
-with its measured visibility profile.
+    ./scripts/run-queue-transport-containers.sh [host-count]

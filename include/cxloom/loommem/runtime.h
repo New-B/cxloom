@@ -58,6 +58,7 @@ class LoomMemRuntime {
     Result<TokenLease> WaitForWriteToken(const TokenRequestHandle& request, std::uint64_t timeout_ms);
     Status ReleaseWriteToken(const TokenLease& lease);
     const QueuePoller* queue_poller() const { return queue_poller_.get(); }
+    std::size_t queue_capacity_entries() const { return config_.queue_capacity_entries; }
     const RegionMapper& region_mapper() const { return region_mapper_; }
 
   private:

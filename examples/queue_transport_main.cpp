@@ -73,19 +73,20 @@ int main() {
   config.local_host_id =
       static_cast<cxloom::HostId>(Parse(std::getenv("CL_HOST_ID"), 0));
   config.host_count =
-      static_cast<std::uint16_t>(Parse(std::getenv("CL_HOST_COUNT"), 4));
+      static_cast<std::uint16_t>(Parse(std::getenv("CL_HOST_COUNT"), 0));
   config.shared_region_bytes =
       Parse(std::getenv("CL_SHARED_REGION_BYTES"), config.shared_region_bytes);
-  config.queue_capacity_entries = Parse(std::getenv("CL_QUEUE_CAPACITY"), 1024);
+  config.queue_capacity_entries = Parse(std::getenv("CL_QUEUE_CAPACITY"), 0);
   config.bootstrap_timeout_ms =
       Parse(std::getenv("CL_QUEUE_TIMEOUT_MS"), 30000);
   config.shared_region_path = path;
   config.bootstrap_owner = Parse(std::getenv("CL_BOOTSTRAP_OWNER"), 0) != 0;
   const auto iterations = Parse(std::getenv("CL_QUEUE_ITERATIONS"), 100000);
-  if (config.host_count != 4 || config.local_host_id >= config.host_count ||
+  if (config.host_count < 2 || config.host_count > cxloom::kMaxHosts ||
+      config.local_host_id >= config.host_count ||
       iterations == 0) {
-    std::cerr << "queue transport litmus requires exactly four hosts and "
-                 "non-zero iterations\n";
+    std::cerr << "queue transport requires 2.." << cxloom::kMaxHosts
+              << " hosts and non-zero iterations\n";
     return 2;
   }
 
@@ -189,8 +190,11 @@ int main() {
                               std::chrono::steady_clock::now() - started)
                               .count();
   std::cout << "host=" << config.local_host_id
-            << " peers=3 queues=12 iterations=" << iterations
-            << " operations=" << iterations * 6 << " elapsed_ms=" << elapsed_ms
+            << " peers=" << config.host_count - 1
+            << " queues=" << config.host_count * (config.host_count - 1)
+            << " iterations=" << iterations
+            << " operations=" << iterations * 2 * (config.host_count - 1)
+            << " elapsed_ms=" << elapsed_ms
             << " poller_cpu=" << poller->bound_cpu()
             << " batch_size=" << poller_options.batch_size
             << " batches=" << stats.batches

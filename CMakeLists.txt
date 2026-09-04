@@ -55,6 +55,9 @@ target_link_libraries(cxloom_visibility_litmus PRIVATE cxloom_loommem)
 add_executable(cxloom_queue_transport examples/queue_transport_main.cpp)
 target_link_libraries(cxloom_queue_transport PRIVATE cxloom_loommem)
 
+add_executable(cxloom_token_stress examples/token_stress_main.cpp)
+target_link_libraries(cxloom_token_stress PRIVATE cxloom_loommem)
+
 enable_testing()
 
 add_executable(cxloom_allocator_test tests/allocator_test.cpp)
@@ -90,3 +93,7 @@ add_test(NAME cxloom_poller_test COMMAND cxloom_poller_test)
 add_executable(cxloom_token_test tests/token_test.cpp)
 target_link_libraries(cxloom_token_test PRIVATE cxloom_loommem)
 add_test(NAME cxloom_token_test COMMAND cxloom_token_test)
+
+add_executable(cxloom_dynamic_host_count_test tests/dynamic_host_count_test.cpp)
+target_link_libraries(cxloom_dynamic_host_count_test PRIVATE cxloom_loommem)
+add_test(NAME cxloom_dynamic_host_count_test COMMAND cxloom_dynamic_host_count_test)

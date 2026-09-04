@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONTAINER_COUNT="${1:-4}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/host-count.sh"
+CONTAINER_COUNT="$(cxloom_resolve_host_count "${1:-}")"
 if ! [[ "$CONTAINER_COUNT" =~ ^[1-9][0-9]*$ ]] || (( CONTAINER_COUNT > 64 )); then
     echo "container-count must be an integer from 1 to 64" >&2
     exit 1

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -69,6 +70,7 @@ class TokenService {
     TokenQueueResolver queue_resolver_;
     VisibilityMode mode_ {VisibilityMode::kReleaseAcquire};
     std::atomic<std::uint64_t> next_request_id_ {1};
+    std::array<std::mutex, kMaxHosts> outbound_mutexes_;
     std::mutex mutex_;
     std::unordered_map<std::uint64_t, LocalObject> objects_;
     std::unordered_map<std::uint64_t, std::shared_ptr<Waiter>> waiters_;

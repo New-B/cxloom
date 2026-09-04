@@ -4,7 +4,9 @@ set -euo pipefail
 # Usage: ./scripts/run-smoke-containers.sh [container-count]
 # This validates build and NUMA placement only. The current runtime does not
 # yet map allocator metadata or queues into the shared CXL backing file.
-CONTAINER_COUNT="${1:-4}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/host-count.sh"
+CONTAINER_COUNT="$(cxloom_resolve_host_count "${1:-}")"
 
 if ! [[ "${CONTAINER_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
     echo "container-count must be a positive integer" >&2

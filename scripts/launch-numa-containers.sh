@@ -41,7 +41,7 @@ set -euo pipefail
 # Usage: ./scripts/launch-numa-containers.sh [container-count]
 # CONTAINER_COUNT: number of containers to launch. It must not exceed the host capacity
 # because each container is mapped onto NUMA-local physical cores.
-CONTAINER_COUNT="${1:-4}"
+CONTAINER_COUNT="${1:-${CL_HOST_COUNT:-}}"
 CXLOOM_IMAGE="${CXLOOM_IMAGE:-cxloom:dev}"
 # With 128 physical cores and hyperthreading disabled, a full-utilization run uses
 # 16 containers × 8 CPUs/container. Keep the count as an argument to the script, but
@@ -69,8 +69,8 @@ if ! [[ "${HOST_PHYSICAL_CPU_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
     HOST_PHYSICAL_CPU_COUNT=1
 fi
 
-if ! [[ "${CONTAINER_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
-    echo "container-count must be a positive integer" >&2
+if ! [[ "${CONTAINER_COUNT}" =~ ^[1-9][0-9]*$ ]] || (( CONTAINER_COUNT > 64 )); then
+    echo "container-count must be provided and be an integer from 1 to 64" >&2
     exit 1
 fi
 if ! [[ "${CXLOOM_CPUS_PER_CONTAINER}" =~ ^[1-9][0-9]*$ ]] || (( CXLOOM_CPUS_PER_CONTAINER > 32 )); then

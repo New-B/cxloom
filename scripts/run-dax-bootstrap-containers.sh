@@ -4,7 +4,9 @@ set -euo pipefail
 # Usage: ./scripts/run-dax-bootstrap-containers.sh [container-count]
 # Host zero publishes the bootstrap first. Other hosts then attach and validate
 # the same /dev/dax0.0 region. Each container builds privately under /tmp.
-CONTAINER_COUNT="${1:-4}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/host-count.sh"
+CONTAINER_COUNT="$(cxloom_resolve_host_count "${1:-}")"
 
 if ! [[ "${CONTAINER_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
     echo "container-count must be a positive integer" >&2

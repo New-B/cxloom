@@ -93,14 +93,14 @@ object directory.
 
 Every directed pair of distinct hosts owns one fixed-capacity ring in the
 shared CXL queue region. Each host can run a CPU-bound round-robin poller with
-batched draining and adaptive idle backoff. Run the four-host all-pairs transport test with:
+batched draining and adaptive idle backoff. Run the variable-scale all-pairs transport test with:
 
 ```bash
 ./scripts/run-queue-transport-containers.sh
 ```
 
 See `docs/cxl-spsc-queue.md` for the shared layout, ordering protocol, capacity
-constraints, and measured results.
+constraints and validation procedure.
 
 ## Queue-Based Write Tokens
 
@@ -109,6 +109,21 @@ Shared allocations carry an authoritative owner, version, and token epoch.
 host-pair queues and the dedicated poller to serialize writers and publish data
 before ownership transfer. See `docs/cxl-token-protocol.md` for the state
 machine and cross-queue ordering rules.
+
+Choose the host count once at container startup. Runtime queue matrices, token
+pollers, and subsequent test scripts inherit that count automatically:
+
+```bash
+./scripts/launch-numa-containers.sh 12
+./scripts/run-token-stress-containers.sh
+```
+
+`CL_HOST_COUNT=12 ./scripts/launch-numa-containers.sh` is equivalent. Explicit
+test-script arguments or environment variables override the discovered value.
+When `queue_capacity_entries` is zero (the default), LoomMem chooses the largest
+per-pair capacity up to 1024 that fits all `N * (N - 1)` directed queues in the
+reserved queue region. Explicit capacities remain supported and are rejected
+if they do not fit.
 
 ## Visibility and Ordering Litmus
 

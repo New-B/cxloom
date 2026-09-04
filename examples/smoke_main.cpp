@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <iostream>
 #include <vector>
 
@@ -7,8 +8,10 @@
 
 int main() {
     cxloom::CxloomConfig config;
-    config.host_count = 4;
-    config.local_host_id = 0;
+    if (const char* host_count = std::getenv("CL_HOST_COUNT"))
+        config.host_count = static_cast<std::uint16_t>(std::strtoul(host_count, nullptr, 10));
+    if (const char* host_id = std::getenv("CL_HOST_ID"))
+        config.local_host_id = static_cast<cxloom::HostId>(std::strtoul(host_id, nullptr, 10));
     config.shared_region_bytes = 512ULL << 20;
 
     cxloom::loommem::LoomMemRuntime loommem(config);
@@ -57,4 +60,3 @@ int main() {
 
     return 0;
 }
-

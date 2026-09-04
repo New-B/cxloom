@@ -34,7 +34,7 @@ Goal:
 
 Tasks:
 
-1. implement a small two-host visibility test harness
+1. implement a small cross-host visibility test harness
 2. test ordinary loads after remote writes
 3. test writeback and fence combinations
 4. test control-word visibility separately from data visibility
@@ -87,7 +87,7 @@ Current status:
 - separated producer tail and consumer head into single-writer cache lines
 - added fixed slots, sequence validation, backpressure, endpoint checks, and visibility-profile integration
 - added a CPU-bound round-robin poller with batch drain, adaptive backoff, dispatch callbacks, and runtime lifecycle management
-- validated all 12 directed queues with four NUMA-pinned hosts on `/dev/dax0.0`
+- validated dynamically sized all-pairs queues on `/dev/dax0.0`
 
 ## Phase 4: LoomMem Allocator and Global Addressing
 
@@ -130,6 +130,8 @@ Progress:
 - token request, grant, forwarding, pending arbitration, and release handoff run over the SPSC queues
 - the runtime poller dispatches token control messages before optional application messages
 - two-host integration coverage validates bidirectional handoff, publication, and stale-lease rejection
+- container and runtime initialization now derive queue topology and capacity from a 1..64 host count
+- variable-scale token and all-pairs queue tests validate non-fixed host counts
 - local replica metadata and reader refresh remain to complete this phase
 
 Exit criteria:

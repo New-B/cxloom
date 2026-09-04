@@ -106,10 +106,42 @@ int main() {
 
     const auto release1 = host1.ReleaseWriteToken(lease1.value());
     const auto lease0_again = host0.WaitForWriteToken(reverse_request.value(), 2000);
-    const bool passed = release1.ok() && lease0_again.ok() && lease0_again.value().version == 2 &&
-                        lease0_again.value().token_epoch == 3 &&
-                        *static_cast<std::uint64_t*>(host0_data.value()) == 42 &&
-                        host0.ReleaseWriteToken(lease0_again.value()).ok();
+    bool passed = release1.ok() && lease0_again.ok() && lease0_again.value().version == 2 &&
+                  lease0_again.value().token_epoch == 3 &&
+                  *static_cast<std::uint64_t*>(host0_data.value()) == 42 &&
+                  host0.ReleaseWriteToken(lease0_again.value()).ok();
+
+    const auto contention_object = host0.AllocateShared(sizeof(std::uint64_t), alignof(std::uint64_t));
+    const auto owner_request = contention_object.ok() ? host0.RequestWriteToken(contention_object.value())
+                                                       : cxloom::Result<cxloom::loommem::TokenRequestHandle>(
+                                                             contention_object.status());
+    const auto owner_lease = owner_request.ok() ? host0.WaitForWriteToken(owner_request.value(), 2000)
+                                                 : cxloom::Result<cxloom::loommem::TokenLease>(
+                                                       owner_request.status());
+    const auto received_before = host0.queue_poller()->stats().messages;
+    const auto first_pending = contention_object.ok() ? host1.RequestWriteToken(contention_object.value())
+                                                       : cxloom::Result<cxloom::loommem::TokenRequestHandle>(
+                                                             contention_object.status());
+    const auto second_pending = contention_object.ok() ? host1.RequestWriteToken(contention_object.value())
+                                                        : cxloom::Result<cxloom::loommem::TokenRequestHandle>(
+                                                              contention_object.status());
+    const auto pending_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (host0.queue_poller()->stats().messages < received_before + 2 &&
+           std::chrono::steady_clock::now() < pending_deadline)
+        std::this_thread::yield();
+    if (!owner_lease.ok() || !first_pending.ok() || !second_pending.ok() ||
+        host0.queue_poller()->stats().messages < received_before + 2 ||
+        !host0.ReleaseWriteToken(owner_lease.value()).ok()) {
+        passed = false;
+    } else {
+        const auto first_lease = host1.WaitForWriteToken(first_pending.value(), 2000);
+        if (!first_lease.ok() || !host1.ReleaseWriteToken(first_lease.value()).ok()) {
+            passed = false;
+        } else {
+            const auto second_lease = host1.WaitForWriteToken(second_pending.value(), 2000);
+            passed = passed && second_lease.ok() && host1.ReleaseWriteToken(second_lease.value()).ok();
+        }
+    }
 
     const auto stop1 = host1.StopQueuePoller();
     const auto stop0 = host0.StopQueuePoller();

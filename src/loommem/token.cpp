@@ -53,9 +53,12 @@ Result<AllocationDescriptor*> TokenService::Descriptor(GlobalPointer object) con
 }
 
 Status TokenService::PushWithBackpressure(HostId destination, QueueEnvelope envelope) {
+    if (destination >= kMaxHosts)
+        return Status::InvalidArgument("token destination is out of range");
     const auto queue = queue_resolver_(local_host_, destination);
     if (!queue.ok())
         return queue.status();
+    std::lock_guard<std::mutex> outbound_lock(outbound_mutexes_[destination]);
     while (true) {
         const auto status = queue.value()->Push(envelope);
         if (status.ok())
@@ -183,9 +186,19 @@ Status TokenService::Grant(const TokenRequest& request, AllocationDescriptor* de
     grant.token_epoch = epoch;
     const auto status = PushWithBackpressure(request.requester, Encode(grant));
     if (status.ok()) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        objects_[request.object.offset].held = false;
-        objects_[request.object.offset].available = false;
+        std::deque<TokenRequest> remaining;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto& state = objects_[request.object.offset];
+            state.held = false;
+            state.available = false;
+            remaining.swap(state.pending);
+        }
+        for (const auto& pending : remaining) {
+            const auto forward_status = SendRequest(request.requester, pending);
+            if (!forward_status.ok())
+                return forward_status;
+        }
     }
     return status;
 }

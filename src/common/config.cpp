@@ -20,9 +20,6 @@ Status ConfigValidator::Validate(const CxloomConfig& config) {
     if (config.coherence_granule_bytes == 0) {
         return Status::InvalidArgument("coherence_granule_bytes must be non-zero");
     }
-    if (config.queue_capacity_entries == 0) {
-        return Status::InvalidArgument("queue_capacity_entries must be non-zero");
-    }
     if (config.bootstrap_timeout_ms == 0) {
         return Status::InvalidArgument("bootstrap_timeout_ms must be non-zero");
     }

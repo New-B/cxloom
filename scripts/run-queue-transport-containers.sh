@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly HOST_COUNT=4
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/host-count.sh"
+HOST_COUNT="$(cxloom_resolve_host_count "${1:-}")"
 ITERATIONS="${CL_QUEUE_ITERATIONS:-100000}"
 BATCH_SIZE="${CL_QUEUE_BATCH_SIZE:-32}"
 
+cxloom_validate_host_count "$HOST_COUNT" 2
 if ! [[ "$ITERATIONS" =~ ^[1-9][0-9]*$ ]] || ! [[ "$BATCH_SIZE" =~ ^[1-9][0-9]*$ ]]; then
     echo "CL_QUEUE_ITERATIONS and CL_QUEUE_BATCH_SIZE must be positive integers" >&2
     exit 1
@@ -55,7 +58,7 @@ if (( owner_ready == 0 )); then
     exit 1
 fi
 
-for host_id in 1 2 3; do
+for ((host_id = 1; host_id < HOST_COUNT; ++host_id)); do
     start_host "$host_id"
     pids+=("$last_pid")
 done
