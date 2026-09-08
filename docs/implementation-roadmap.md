@@ -299,5 +299,37 @@ splitting and adjacent-range coalescing.
 
 Current object retirement tracks active references per host, blocks new
 acquires through `RETIRING`, waits for references and writebacks to drain, and
-then invalidates the descriptor before returning both extents. A measured CXL
-publication recipe and host-failure recovery remain future work.
+then invalidates the descriptor before returning both extents. The current single-machine coherent emulation profile has a measured
+release/acquire publication recipe. Physical non-coherent multi-host validation
+is deferred until hardware is available; host-failure recovery remains future
+work.
+
+## Active Development Baseline (2026-09-05)
+
+The LoomMem regression at revision
+`2e3e1eba2a05c978e77420b5b42021508324d1b0` passed all 12 CTest tests,
+16-container DAX initialization, queue, token and coherence tests, and all four
+visibility recipes at 100,000 iterations each. See
+[the baseline report](loommem-baseline-20260905.md) for evidence and scope.
+
+The available platform is one multi-NUMA server with containers representing
+logical hosts. The user explicitly agreed to defer physical non-coherent
+multi-host validation until that hardware is available. This does not block
+Phase 6 on the validated emulation platform, and does not establish correctness
+on physical non-coherent hardware.
+
+The next implementation milestone is LoomPar lifecycle control: real local
+thread execution and blocking join, followed by two-host remote create and
+completion with home-owned lifecycle state. Synchronization must compose with
+LoomMem publication before advancing to distributed barriers and placement.
+
+## Phase 8 update (2026-09-06)
+
+The Phase 6/7 implementation now has local and 16-process regression coverage.
+Phase 8 includes weighted placement and a reproducible policy simulation;
+see [the evaluation report](phase8-evaluation-20260906.md). Full CTest: 22/22 passed.
+A tested home migration transaction model defines commit/rollback and epoch
+validation, but runtime transport and serializable continuation integration
+remain open. The attempted 16-container DAX acceptance stopped at Docker socket
+permission denial before launching any workload. Earlier "next milestone" text
+above describes the September 5 baseline, not the current implementation frontier.

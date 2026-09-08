@@ -16,7 +16,8 @@ Status TokenCoherenceManager::AcquireRead(ObjectMetadata& object, ReplicaMetadat
 
 Status TokenCoherenceManager::AcquireWrite(ObjectMetadata& object, ReplicaMetadata& replica) {
     if (object.token_owner != local_host_) {
-        return Status::Unimplemented("remote token transfer path is not implemented yet");
+        return Status::FailedPrecondition(
+            "remote token ownership must be transferred by TokenService before AcquireWrite");
     }
     replica.cached = true;
     return Status::Ok();
@@ -33,4 +34,3 @@ Status TokenCoherenceManager::ReleaseWrite(ObjectMetadata& object, ReplicaMetada
 }
 
 }  // namespace cxloom::loommem
-

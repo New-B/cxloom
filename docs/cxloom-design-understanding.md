@@ -513,3 +513,64 @@ CXLoom should be implemented as a two-layer co-designed runtime:
 - `LoomPar` is the distributed thread runtime above LoomMem, preserving Pthreads-like create/join/barrier semantics, using home-owned global thread lifecycle management, metadata-only remote launch, pinned execution, and placement guided by load plus memory/coherence locality.
 
 The most important architectural decision is that CXLoom should not treat memory and execution as separate afterthoughts. LoomMem exposes coherence state, and LoomPar should use that state to place threads where the total execution plus coherence cost is lowest.
+
+## 13. Implementation Scope Update (2026-09-05)
+
+The current delivery order overrides the validation-first engineering sequence
+in sections 3.9 and 10: LoomMem non-coherent multi-host validation is deferred
+and does not block LoomPar local or cross-container execution development.
+This does not establish non-coherent data visibility correctness.
+
+1. Real native local execution and blocking join, using the common GTID,
+   function registry and home-owned lifecycle interfaces.
+2. Cross-container create, acknowledgement, completion, join and reclamation
+   over the shared CXL queues.
+3. Synchronization and LoomMem release/acquire integration.
+4. Placement, resource control and an expanded cross-node/container thread
+   scheduling design. The extension must specify whether and how execution
+   can be rescheduled after creation; live stack/continuation migration is not
+   implemented by the current pinned execution milestone. Section 5.2 describes
+   the baseline, not a permanent restriction on this future extension.
+
+Host crashes and transparent recovery are outside the current version.
+See [LoomPar execution milestone](loompar-execution-milestone.md) for the
+implemented contract, validation evidence and remaining work.
+
+### Acceptance scale clarification
+
+All subsequent container validation and acceptance experiments use **16 containers**,
+not a minimal two-container deployment. The current execution milestone must cover
+remote argument delivery, completion and reclamation, concurrent creators, nested
+cross-host create/join and a long-running workload at that scale. Process-only
+regressions also use 16 hosts, but do not replace the required container acceptance.
+
+## 14. Synchronization implementation contract
+
+The C++ LoomPar runtime now implements a reusable blocking world barrier, with
+fixed positive local participant counts per barrier ID (counts can differ across
+hosts), coordinator host 0, explicit generations and local condition-variable
+waiters. All configured hosts must arrive. Duplicate arrivals count once and stale
+round messages cannot release a later round. Membership subsets, missing-host
+recovery and dynamic participant registration are not part of this version.
+
+LoomMem supplies SynchronizeRelease/SynchronizeAcquire hooks at create dispatch,
+worker entry/completion, join completion and barrier arrival/return. Its existing
+ReleaseWriteBuffer is still an immediate commit. StageWriteBuffer explicitly
+transfers a finished mutable buffer to the current thread's next release boundary;
+raw outstanding buffers are not silently committed. Acquire clears reusable local
+replicas but leaves previously returned immutable snapshots unchanged. Applications
+must reacquire snapshots to observe later publications.
+
+See [the detailed synchronization contract](loompar-synchronization.md) for
+ownership, failure behavior, participant rules and the 16-host validation workload.
+Physical non-coherent visibility validation remains deferred.
+
+## 15. Application API boundary
+
+The public LoomPar programming model is an opaque C interface with
+`cl_pthread_create`, `cl_pthread_join`, and reusable barrier functions. The
+runtime internally derives function identity, serializes bounded arguments,
+selects execution hosts, performs admission and queue transport, manages GTIDs,
+and applies synchronization hooks. Applications do not provide placement hints
+or control messages. The C++ LoomPar classes remain internal implementation and
+test interfaces.

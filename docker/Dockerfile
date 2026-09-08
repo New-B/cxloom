@@ -14,7 +14,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN sed -i 's|http://archive.ubuntu.com/ubuntu|http://mirrors.aliyun.com/ubuntu|g; s|http://security.ubuntu.com/ubuntu|http://mirrors.aliyun.com/ubuntu|g' /etc/apt/sources.list || true
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    bash build-essential ca-certificates cmake ninja-build numactl procps util-linux \
+    bash build-essential ca-certificates cmake ninja-build numactl procps python3 util-linux \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace

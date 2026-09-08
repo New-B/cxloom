@@ -36,6 +36,9 @@ struct HostLoadSnapshot {
     HostId host_id {0};
     std::uint32_t running_threads {0};
     std::uint32_t pending_creates {0};
+    std::uint32_t queued_messages {0};
+    std::uint64_t sample_sequence {0};
+    std::uint64_t sampled_at_ns {0};
 };
 
 inline bool operator==(const GlobalPointer& lhs, const GlobalPointer& rhs) {

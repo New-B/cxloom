@@ -6,6 +6,6 @@
 #include "cxloom/loommem.h"
 #endif
 
-// LoomPar's cl_thread_* API will be added here as its distributed execution
-// paths become functional. Keeping this umbrella header stable lets C users
-// include one public CXLoom interface from the start.
+// Public CXLoom umbrella header. The cl_pthread_* APIs expose only pthread-like
+// lifecycle operations; placement, queues and execution-host decisions remain
+// internal to LoomPar.

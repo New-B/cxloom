@@ -169,6 +169,8 @@ Status LoomMemRuntime::Initialize() {
 }
 
 Status LoomMemRuntime::Finalize() {
+    if (staged_write_count())
+        return Status::FailedPrecondition("publish staged writes before finalizing LoomMem");
     initialized_ = false;
     const auto poller_status = StopQueuePoller();
     queue_poller_.reset();
@@ -973,6 +975,55 @@ Status LoomMemRuntime::AbortWriteBuffer(const WriteBuffer& write) {
     if (result.ok())
         write.reference_guard.reset();
     return result;
+}
+
+Status LoomMemRuntime::StageWriteBuffer(WriteBuffer* write) {
+    if (!initialized_ || !token_service_ || !write || !write->storage || !write->reference_guard)
+        return Status::FailedPrecondition("stage requires an active owned write buffer");
+    if (write->storage.use_count() != 1 || write->reference_guard.use_count() != 1)
+        return Status::FailedPrecondition("staging requires exclusive write buffer ownership");
+    std::lock_guard<std::mutex> lock(staged_mutex_);
+    staged_writes_[std::this_thread::get_id()].push_back(std::move(*write));
+    *write = WriteBuffer{};
+    return Status::Ok();
+}
+
+std::size_t LoomMemRuntime::staged_write_count() const {
+    std::lock_guard<std::mutex> lock(staged_mutex_);
+    std::size_t count = 0;
+    for (const auto& item : staged_writes_) count += item.second.size();
+    return count;
+}
+
+Status LoomMemRuntime::SynchronizeRelease() {
+    if (!initialized_) return Status::FailedPrecondition("release requires initialized LoomMem");
+    std::vector<WriteBuffer> writes;
+    {
+        std::lock_guard<std::mutex> lock(staged_mutex_);
+        auto it = staged_writes_.find(std::this_thread::get_id());
+        if (it != staged_writes_.end()) {
+            writes = std::move(it->second);
+            staged_writes_.erase(it);
+        }
+    }
+    Status result = Status::Ok();
+    for (auto& write : writes) {
+        if (result.ok()) result = ReleaseWriteBuffer(write);
+        if (!result.ok()) AbortWriteBuffer(write);
+    }
+    std::atomic_thread_fence(std::memory_order_release);
+    return result;
+}
+
+Status LoomMemRuntime::SynchronizeAcquire() {
+    if (!initialized_) return Status::FailedPrecondition("acquire requires initialized LoomMem");
+    std::atomic_thread_fence(std::memory_order_acquire);
+    std::lock_guard<std::mutex> lock(replicas_mutex_);
+    replicas_.clear();
+    cached_replica_bytes_ = 0;
+    // Existing immutable snapshots retain their storage. Subsequent reads validate
+    // versions and fetch through AcquireReadRange rather than mutating old snapshots.
+    return Status::Ok();
 }
 
 Status LoomMemRuntime::InitializeBootstrap() {

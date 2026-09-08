@@ -220,6 +220,7 @@ SpscQueue::SpscQueue(SharedQueueStorage storage, HostId local_host,
       visibility_mode_(visibility_mode) {}
 
 Status SpscQueue::Push(const QueueEnvelope &message) {
+  std::lock_guard<std::mutex> lock(producer_mutex_);
   if (header_ == nullptr || slots_ == nullptr)
     return Status::FailedPrecondition("shared SPSC queue is not attached");
   if (local_host_ != producer())

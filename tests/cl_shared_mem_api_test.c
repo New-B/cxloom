@@ -45,6 +45,22 @@ int main(void) {
         goto done;
     }
 
+    // Starting the pthread layer starts each runtime's queue poller. Exercise
+    // the coherence path through the C GPtr API rather than raw mappings.
+    cl_pthread_mutex_t owner_mutex = {0};
+    cl_pthread_mutex_t attacher_mutex = {0};
+    if (cl_pthread_mutex_init(owner, &owner_mutex) != CL_OK ||
+        cl_pthread_mutex_init(attacher, &attacher_mutex) != CL_OK)
+        goto done;
+    uint64_t wire_value = UINT64_C(0x43584c4f4f4d0042);
+    uint64_t observed_value = 0;
+    if (cl_mem_write(owner, owner_object, 0, &wire_value, sizeof(wire_value), 5000) != CL_OK ||
+        cl_mem_read(attacher, owner_object, 0, &observed_value, sizeof(observed_value), 5000) != CL_OK ||
+        observed_value != wire_value)
+        goto done;
+    cl_pthread_mutex_destroy(&attacher_mutex);
+    cl_pthread_mutex_destroy(&owner_mutex);
+
     void* owner_local = NULL;
     void* owner_remote = NULL;
     void* attacher_local = NULL;

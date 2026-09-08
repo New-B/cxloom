@@ -23,6 +23,8 @@ enum class MessageKind : std::uint16_t {
     kTokenRetire,
     kTokenRetireAck,
     kLoadUpdate,
+    kMigrateReq,
+    kMigrateAck,
 };
 
 struct MessageHeader {
@@ -30,6 +32,21 @@ struct MessageHeader {
     HostId src_host {0};
     HostId dst_host {0};
     std::uint32_t payload_bytes {0};
+};
+
+struct MigrationRequest {
+    MessageHeader header {};
+    GlobalThreadId gtid {};
+    HostId target_host {0};
+    std::uint64_t migration_epoch {0};
+};
+
+struct MigrationAck {
+    MessageHeader header {};
+    GlobalThreadId gtid {};
+    HostId target_host {0};
+    std::uint64_t migration_epoch {0};
+    std::int32_t status {0};
 };
 
 struct CreateRequest {
@@ -49,7 +66,18 @@ struct CompleteNotify {
     MessageHeader header {};
     GlobalThreadId gtid {};
     std::int32_t exit_code {0};
+    std::uint64_t result_value {0};
+    std::vector<std::byte> result_bytes;
     std::uint32_t remote_running_threads {0};
+};
+
+struct LoadUpdate {
+    MessageHeader header {};
+    std::uint32_t running_threads {0};
+    std::uint32_t pending_creates {0};
+    std::uint32_t queued_messages {0};
+    std::uint64_t sample_sequence {0};
+    std::uint64_t sampled_at_ns {0};
 };
 
 struct BarrierArrive {

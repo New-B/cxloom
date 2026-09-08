@@ -1,5 +1,6 @@
 #pragma once
 
+#include <thread>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -108,6 +109,11 @@ class LoomMemRuntime {
                                           WriteAtomicity atomicity = WriteAtomicity::kPerBlock);
     Status ReleaseWriteBuffer(const WriteBuffer& write);
     Status AbortWriteBuffer(const WriteBuffer& write);
+    // Transfers a buffer to the calling thread's next release boundary.
+    Status StageWriteBuffer(WriteBuffer* write);
+    Status SynchronizeRelease();
+    Status SynchronizeAcquire();
+    std::size_t staged_write_count() const;
     const QueuePoller* queue_poller() const { return queue_poller_.get(); }
     std::size_t queue_capacity_entries() const { return config_.queue_capacity_entries; }
     std::size_t cached_replica_count() const;
@@ -139,6 +145,8 @@ class LoomMemRuntime {
     std::unordered_map<std::uint64_t, CachedReplica> replicas_;
     std::size_t cached_replica_bytes_ {0};
     std::uint64_t replica_access_clock_ {0};
+    mutable std::mutex staged_mutex_;
+    std::unordered_map<std::thread::id, std::vector<WriteBuffer>> staged_writes_;
     bool initialized_ {false};
 
     Status InitializeBootstrap();

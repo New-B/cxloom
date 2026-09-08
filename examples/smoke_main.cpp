@@ -39,12 +39,18 @@ int main() {
     hint.dominant_gptr = alloc.value();
     hint.label = "smoke-thread";
 
+    auto registered = loompar.RegisterFunction("smoke_worker", +[](void*) {});
+    if (!registered.ok()) return 1;
+    hint.has_explicit_host = true;
+    hint.explicit_host = config.local_host_id;
     auto thread = loompar.CreateThread("smoke_worker", std::vector<std::byte>{}, hint);
     std::cout << "shared object at offset " << alloc.value().offset << "\n";
     if (!thread.ok()) {
-        std::cout << "thread creation is expectedly incomplete in the skeleton: "
-                  << thread.status().message() << "\n";
+        std::cerr << thread.status().message() << "\n";
+        return 1;
     }
+    if (!loompar.JoinThread(thread.value()).ok()) return 1;
+
 
     auto finalize_status = loompar.Finalize();
     if (!finalize_status.ok()) {

@@ -29,6 +29,7 @@ target_link_libraries(cxloom_loommem PUBLIC cxloom_common)
 
 add_library(cxloom_loompar STATIC
     src/loompar/barrier.cpp
+    src/loompar/fiber.cpp
     src/loompar/runtime.cpp
     src/loompar/scheduler.cpp
     src/loompar/threading.cpp
@@ -41,7 +42,7 @@ add_library(cxloom STATIC
     src/api/loommem.cpp
 )
 target_include_directories(cxloom PUBLIC include)
-target_link_libraries(cxloom PUBLIC cxloom_loommem)
+target_link_libraries(cxloom PUBLIC cxloom_loommem cxloom_loompar ${CMAKE_DL_LIBS})
 
 add_executable(cxloom_smoke examples/smoke_main.cpp)
 target_link_libraries(cxloom_smoke PRIVATE cxloom_common cxloom_loommem cxloom_loompar)
@@ -115,3 +116,54 @@ add_test(NAME cxloom_coherence_test COMMAND cxloom_coherence_test)
 add_executable(cxloom_block_range_test tests/block_range_test.cpp)
 target_link_libraries(cxloom_block_range_test PRIVATE cxloom_loommem)
 add_test(NAME cxloom_block_range_test COMMAND cxloom_block_range_test)
+
+find_package(Threads REQUIRED)
+target_link_libraries(cxloom_loompar PUBLIC Threads::Threads)
+add_executable(cxloom_loompar_test tests/loompar_test.cpp)
+target_link_libraries(cxloom_loompar_test PRIVATE cxloom_loompar)
+add_test(NAME cxloom_loompar_test COMMAND cxloom_loompar_test)
+set_tests_properties(cxloom_loompar_test PROPERTIES TIMEOUT 30)
+add_executable(cxloom_fiber_test tests/fiber_test.cpp)
+target_link_libraries(cxloom_fiber_test PRIVATE cxloom_loompar)
+add_test(NAME cxloom_fiber_test COMMAND cxloom_fiber_test)
+add_executable(cxloom_loompar_migration_test tests/loompar_migration_test.cpp)
+target_link_libraries(cxloom_loompar_migration_test PRIVATE cxloom_loompar)
+add_test(NAME cxloom_loompar_migration_test COMMAND cxloom_loompar_migration_test)
+
+add_executable(cxloom_loompar_threads examples/loompar_threads_main.cpp)
+target_link_libraries(cxloom_loompar_threads PRIVATE cxloom_loompar)
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME cxloom_loompar_process_test COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/loompar_process_test.py $<TARGET_FILE:cxloom_loompar_threads>)
+set_tests_properties(cxloom_loompar_process_test PROPERTIES TIMEOUT 180)
+
+add_executable(cxloom_loompar_sync examples/loompar_sync_main.cpp)
+target_link_libraries(cxloom_loompar_sync PRIVATE cxloom_loompar)
+add_test(NAME cxloom_loompar_sync_process_test COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/loompar_process_test.py $<TARGET_FILE:cxloom_loompar_sync>)
+set_tests_properties(cxloom_loompar_sync_process_test PROPERTIES TIMEOUT 180)
+
+add_executable(cxloom_loompar_barrier_test tests/loompar_barrier_test.cpp)
+target_link_libraries(cxloom_loompar_barrier_test PRIVATE cxloom_loompar)
+add_test(NAME cxloom_loompar_barrier_test COMMAND cxloom_loompar_barrier_test)
+set_tests_properties(cxloom_loompar_barrier_test PROPERTIES TIMEOUT 30)
+
+add_executable(cxloom_loompar_resource_test tests/loompar_resource_test.cpp)
+target_link_libraries(cxloom_loompar_resource_test PRIVATE cxloom_loompar)
+add_test(NAME cxloom_loompar_resource_test COMMAND cxloom_loompar_resource_test)
+
+add_executable(cxloom_loompar_scheduler_test tests/loompar_scheduler_test.cpp)
+target_link_libraries(cxloom_loompar_scheduler_test PRIVATE cxloom_loompar)
+add_test(NAME cxloom_loompar_scheduler_test COMMAND cxloom_loompar_scheduler_test)
+
+add_executable(cxloom_cl_pthread_api_test tests/cl_pthread_api_test.c)
+target_link_libraries(cxloom_cl_pthread_api_test PRIVATE cxloom)
+set_target_properties(cxloom_cl_pthread_api_test PROPERTIES LINKER_LANGUAGE CXX)
+add_test(NAME cxloom_cl_pthread_api_test COMMAND cxloom_cl_pthread_api_test)
+
+add_executable(cxloom_migration_protocol_test tests/migration_protocol_test.cpp)
+target_link_libraries(cxloom_migration_protocol_test PRIVATE cxloom_loompar)
+add_test(NAME cxloom_migration_protocol_test COMMAND cxloom_migration_protocol_test)
+
+add_executable(cxloom_loompar_scheduler_bench examples/loompar_scheduler_bench.cpp)
+target_link_libraries(cxloom_loompar_scheduler_bench PRIVATE cxloom_loompar)

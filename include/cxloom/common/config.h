@@ -40,6 +40,13 @@ struct CxloomConfig {
 
     std::uintptr_t cxl_base_hint {0};
     double scheduler_slack_ratio {0.25};
+    // Zero means unlimited. Limits are enforced independently on each execution host.
+    std::uint32_t max_running_threads_per_host {0};
+    std::uint32_t max_pending_creates_per_host {0};
+    double scheduler_load_half_life_ms {250.0};
+    double scheduler_queue_weight {1.0};
+    double scheduler_history_weight {0.5};
+    double scheduler_remote_locality_penalty {2.0};
 
     std::string instance_name {"cxloom"};
 };

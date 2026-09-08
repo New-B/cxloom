@@ -1,5 +1,6 @@
 #pragma once
 
+#include <mutex>
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -93,6 +94,7 @@ public:
   HostId consumer() const;
 
 private:
+  std::mutex producer_mutex_;
   SharedSpscQueueHeader *header_{nullptr};
   SharedSpscQueueSlot *slots_{nullptr};
   HostId local_host_{0};

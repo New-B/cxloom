@@ -7,6 +7,11 @@ The codebase is split into two peer subsystems:
 - `LoomMem`: shared-memory allocation, global addressing, software coherence, versioning, local replicas, and CXL-resident queues
 - `LoomPar`: distributed thread create/join, placement, barrier, lifecycle management, and memory-aware execution
 
+Applications use the opaque C `cl_pthread_*` interface for thread creation,
+join and barriers. The runtime chooses placement, load admission, queue
+transport and execution hosts internally. The lower-level C++ LoomPar classes
+are implementation and test interfaces, not the application programming model.
+
 ## Repository Layout
 
 - `include/cxloom/common`: shared types, config, status, message definitions
@@ -27,7 +32,7 @@ cmake --build build
 
 ## Current Status
 
-This repository currently contains a compile-ready architecture skeleton. Most distributed and coherence operations intentionally return `Unimplemented` so we can fill them in step by step while keeping module boundaries stable.
+LoomPar now supports native local threads, blocking join and remote create/completion over the shared CXL queues. The remote lifecycle has been validated with 16 independent file-backed host processes; container/devdax validation remains pending. A generation-aware blocking world barrier and explicit LoomMem release/acquire hooks are implemented; expanded cross-node scheduling remains next. See [the execution milestone](docs/loompar-execution-milestone.md) for API contracts, validation and current limits, and [the synchronization contract](docs/loompar-synchronization.md) for staged writes and barrier participation.
 
 ## C API
 
@@ -123,11 +128,11 @@ Choose the host count once at container startup. Runtime queue matrices, token
 pollers, and subsequent test scripts inherit that count automatically:
 
 ```bash
-./scripts/launch-numa-containers.sh 12
+./scripts/launch-numa-containers.sh 16
 ./scripts/run-token-stress-containers.sh
 ```
 
-`CL_HOST_COUNT=12 ./scripts/launch-numa-containers.sh` is equivalent. Explicit
+`CL_HOST_COUNT=16 ./scripts/launch-numa-containers.sh` is equivalent. Explicit
 test-script arguments or environment variables override the discovered value.
 When `queue_capacity_entries` is zero (the default), LoomMem chooses the largest
 per-pair capacity up to 1024 that fits all `N * (N - 1)` directed queues in the

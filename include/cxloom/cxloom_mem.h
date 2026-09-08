@@ -10,6 +10,21 @@ extern "C" {
 typedef struct cl_runtime cl_runtime_t;
 
 typedef struct {
+    uint16_t home_host;
+    uint64_t local_tid;
+} cl_pthread_t;
+
+typedef void *(*cl_pthread_start_routine)(void *);
+typedef struct { void *impl; } cl_pthread_mutex_t;
+typedef struct { void *impl; } cl_pthread_cond_t;
+
+typedef struct {
+    cl_runtime_t *runtime;
+    uint64_t barrier_id;
+    size_t local_participants;
+} cl_pthread_barrier_t;
+
+typedef struct {
     uint32_t region_id;
     uint64_t offset;
 } cl_gptr_t;
@@ -51,6 +66,9 @@ typedef enum {
 
 // Creates a LoomMem runtime. The caller owns the returned handle.
 cl_status_t cl_runtime_create(const cl_config_t *config, cl_runtime_t **runtime);
+// Finalizes the runtime and reports lifecycle violations (unjoined threads,
+// active barriers, staged writes, or undrained transport).
+cl_status_t cl_runtime_finalize(cl_runtime_t *runtime);
 void cl_runtime_destroy(cl_runtime_t *runtime);
 
 // Allocates an object from the shared CXL data region. Shared DAX allocations
@@ -63,6 +81,37 @@ cl_status_t cl_mem_free(cl_runtime_t *runtime, cl_gptr_t gptr);
 // address is for bootstrap/mapping tests only until coherence acquire/release
 // operations are added.
 cl_status_t cl_mem_resolve_local(cl_runtime_t *runtime, cl_gptr_t gptr, void **out_address);
+cl_status_t cl_mem_read(cl_runtime_t *runtime, cl_gptr_t gptr, size_t offset,
+                        void *out_bytes, size_t bytes, uint64_t timeout_ms);
+cl_status_t cl_mem_write(cl_runtime_t *runtime, cl_gptr_t gptr, size_t offset,
+                         const void *bytes, size_t byte_count, uint64_t timeout_ms);
+
+// Pthreads-shaped LoomPar API. Placement, transport and execution host are
+// selected internally. arg_bytes makes the argument representation explicit so
+// a remote invocation never transmits a process-local pointer.
+cl_status_t cl_pthread_create(cl_runtime_t *runtime, cl_pthread_t *thread,
+                              cl_pthread_start_routine start_routine,
+                              const void *arg, size_t arg_bytes);
+cl_status_t cl_pthread_join(cl_runtime_t *runtime, cl_pthread_t thread, void **retval);
+cl_status_t cl_pthread_detach(cl_runtime_t *runtime, cl_pthread_t thread);
+// Cooperative migration checkpoint. Must be called by the current callback.
+cl_status_t cl_pthread_migration_safe_point(cl_runtime_t *runtime);
+cl_status_t cl_pthread_mutex_init(cl_runtime_t *runtime, cl_pthread_mutex_t *mutex);
+cl_status_t cl_pthread_mutex_lock(cl_pthread_mutex_t *mutex);
+cl_status_t cl_pthread_mutex_trylock(cl_pthread_mutex_t *mutex);
+cl_status_t cl_pthread_mutex_unlock(cl_pthread_mutex_t *mutex);
+cl_status_t cl_pthread_mutex_destroy(cl_pthread_mutex_t *mutex);
+cl_status_t cl_pthread_cond_init(cl_runtime_t *runtime, cl_pthread_cond_t *condition);
+cl_status_t cl_pthread_cond_wait(cl_pthread_cond_t *condition, cl_pthread_mutex_t *mutex);
+cl_status_t cl_pthread_cond_timedwait(cl_pthread_cond_t *condition, cl_pthread_mutex_t *mutex,
+                                      uint64_t timeout_ms);
+cl_status_t cl_pthread_cond_signal(cl_pthread_cond_t *condition);
+cl_status_t cl_pthread_cond_broadcast(cl_pthread_cond_t *condition);
+cl_status_t cl_pthread_cond_destroy(cl_pthread_cond_t *condition);
+cl_status_t cl_pthread_barrier_init(cl_runtime_t *runtime, cl_pthread_barrier_t *barrier,
+                                    size_t local_participants);
+cl_status_t cl_pthread_barrier_wait(cl_pthread_barrier_t *barrier);
+cl_status_t cl_pthread_barrier_destroy(cl_pthread_barrier_t *barrier);
 
 #ifdef __cplusplus
 }
