@@ -28,9 +28,9 @@ void CpuRelax() {
 QueuePoller::QueuePoller(HostId local_host,
                          std::vector<SpscQueue *> inbound_queues,
                          QueueMessageHandler handler,
-                         QueuePollerOptions options)
+                         QueuePollerOptions options, std::function<Status()> progress)
     : local_host_(local_host), inbound_queues_(std::move(inbound_queues)),
-      handler_(std::move(handler)), options_(options) {}
+      handler_(std::move(handler)), options_(options), progress_(std::move(progress)) {}
 
 QueuePoller::~QueuePoller() { Stop(); }
 
@@ -198,7 +198,16 @@ void QueuePoller::Run() {
   std::uint64_t idle_rounds = 0;
   while (running_.load(std::memory_order_acquire)) {
     scans_.fetch_add(1, std::memory_order_relaxed);
-    if (ScanOnce()) {
+    const bool progressed = ScanOnce();
+    if (progress_ && running_.load(std::memory_order_acquire)) {
+      const auto status = progress_();
+      if (!status.ok()) {
+        RecordTerminalStatus(status);
+        running_.store(false, std::memory_order_release);
+        break;
+      }
+    }
+    if (progressed) {
       idle_rounds = 0;
       continue;
     }

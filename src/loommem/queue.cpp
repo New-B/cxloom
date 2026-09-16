@@ -352,6 +352,14 @@ Result<std::size_t> SpscQueue::Size() const {
   return static_cast<std::size_t>(tail - head);
 }
 
+std::uint64_t SpscQueue::PublishedSequence() const {
+  return header_->producer.tail.load(std::memory_order_acquire);
+}
+
+std::uint64_t SpscQueue::ConsumedSequence() const {
+  return header_->consumer.head.load(std::memory_order_acquire);
+}
+
 std::size_t SpscQueue::capacity() const {
   return header_ == nullptr ? 0 : header_->identity.capacity_entries;
 }

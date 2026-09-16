@@ -29,7 +29,7 @@ native handle without a join. Completion messages carry a fixed-width
 pointer addresses. Applications should treat the token as an opaque result
 handle or place structured results in a shared GPtr object.
 
-Mutexes use a local native lock for a single-host private runtime. When multiple
+Mutexes use a local native lock for a single-host runtime. When multiple
 hosts share a LoomMem region, initialization allocates an internal shared token
 object and lock/unlock acquire and release its write lease, while preserving the
 same opaque API. Distributed condition variables use a shared sequence word:
@@ -40,9 +40,8 @@ Timed waits are available through `cl_pthread_cond_timedwait`; timeout returns
 `CL_UNAVAILABLE` after the mutex has been reacquired.
 
 `cl_mem_read` and `cl_mem_write` are the C-level GPtr access path. They perform
-LoomMem acquire/release operations for shared mappings, so callers do not need
-to resolve a process-local address. Private single-host runtimes still require
-the existing local-resolve API for direct memory access.
+LoomMem block-level acquire/release operations on the shared region, including
+in single-host configurations. Callers do not need to resolve a local address.
 
 The `arg_bytes` parameter is the C API's explicit serialization boundary. It
 copies a bounded argument record into the launch message; it never transmits a

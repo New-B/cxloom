@@ -6,13 +6,20 @@
 #include "cxloom/loommem/runtime.h"
 #include "cxloom/loompar/runtime.h"
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc != 2) {
+        std::cerr << "Usage: cxloom_smoke <shared-region-path>\n";
+        return 1;
+    }
     cxloom::CxloomConfig config;
     if (const char* host_count = std::getenv("CL_HOST_COUNT"))
         config.host_count = static_cast<std::uint16_t>(std::strtoul(host_count, nullptr, 10));
     if (const char* host_id = std::getenv("CL_HOST_ID"))
         config.local_host_id = static_cast<cxloom::HostId>(std::strtoul(host_id, nullptr, 10));
     config.shared_region_bytes = 512ULL << 20;
+    config.shared_region_path = argv[1];
+    config.bootstrap_owner = config.local_host_id == 0;
+    config.create_region_file = config.bootstrap_owner;
 
     cxloom::loommem::LoomMemRuntime loommem(config);
     auto mem_status = loommem.Initialize();
@@ -58,6 +65,7 @@ int main() {
         return 1;
     }
 
+    if (!loommem.FreeShared(alloc.value()).ok()) return 1;
     auto mem_finalize = loommem.Finalize();
     if (!mem_finalize.ok()) {
         std::cerr << "LoomMem finalize failed: " << mem_finalize.message() << "\n";

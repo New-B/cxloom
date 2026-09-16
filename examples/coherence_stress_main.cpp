@@ -40,11 +40,11 @@ bool Valid(const cxloom::loommem::ReadSnapshot &snapshot,
   if (snapshot.data() == nullptr || snapshot.bytes() != sizeof(Record))
     return false;
   const auto &record = *static_cast<const Record *>(snapshot.data());
-  if (snapshot.version == 0)
+  if (snapshot.block_versions.at(0) == 0)
     return record.sequence == 0;
   const auto writer =
-      static_cast<cxloom::HostId>((snapshot.version - 1) % host_count);
-  const auto expected = MakeRecord(snapshot.version, writer);
+      static_cast<cxloom::HostId>((snapshot.block_versions.at(0) - 1) % host_count);
+  const auto expected = MakeRecord(snapshot.block_versions.at(0), writer);
   if (record.sequence != expected.sequence || record.writer != expected.writer ||
       record.checksum != expected.checksum)
     return false;
@@ -128,7 +128,7 @@ int main() {
 
     const auto snapshot =
         runtime.AcquireReadSnapshot(object, config.bootstrap_timeout_ms);
-    if (!snapshot.ok() || snapshot.value().version > round + 1 ||
+    if (!snapshot.ok() || snapshot.value().block_versions.at(0) > round + 1 ||
         !Valid(snapshot.value(), config.host_count))
       ++errors;
 
@@ -146,7 +146,7 @@ int main() {
 
   const auto final_snapshot =
       runtime.AcquireReadSnapshot(object, config.bootstrap_timeout_ms);
-  if (!final_snapshot.ok() || final_snapshot.value().version != iterations ||
+  if (!final_snapshot.ok() || final_snapshot.value().block_versions.at(0) != iterations ||
       !Valid(final_snapshot.value(), config.host_count))
     ++errors;
 
@@ -159,7 +159,7 @@ int main() {
   std::cout << "host=" << config.local_host_id
             << " hosts=" << config.host_count << " iterations=" << iterations
             << " final_version="
-            << (final_snapshot.ok() ? final_snapshot.value().version : 0)
+            << (final_snapshot.ok() ? final_snapshot.value().block_versions.at(0) : 0)
             << " elapsed_ms=" << elapsed_ms << " errors=" << errors << "\n";
   runtime.Finalize();
   return errors == 0 ? 0 : 1;

@@ -56,12 +56,7 @@ cxloom::CxloomConfig ToCppConfig(const cl_config_t& config) {
     result.local_host_id = config.local_host_id;
     result.host_count = config.host_count;
     result.shared_region_bytes = config.shared_region_bytes;
-    result.per_host_extent_bytes = config.per_host_extent_bytes;
     result.coherence_granule_bytes = config.coherence_granule_bytes;
-    result.default_coherence_granularity =
-        config.default_coherence_granularity == CL_COHERENCE_FIXED_BLOCK
-            ? cxloom::CoherenceGranularity::kFixedBlock
-            : cxloom::CoherenceGranularity::kObject;
     result.queue_capacity_entries = config.queue_capacity_entries;
     if (config.shared_region_path != nullptr) {
         result.shared_region_path = config.shared_region_path;
@@ -403,17 +398,8 @@ extern "C" cl_status_t cl_mem_free(cl_runtime_t* runtime, cl_gptr_t gptr) {
 extern "C" cl_status_t cl_mem_read(cl_runtime_t* runtime, cl_gptr_t gptr, size_t offset,
                                      void* out_bytes, size_t bytes, uint64_t timeout_ms) {
     if (!runtime || !out_bytes || bytes == 0 || timeout_ms == 0) return CL_INVALID_ARGUMENT;
-    if (runtime->config.host_count <= 1) {
-        auto allocation = runtime->loommem.DescribeSharedAllocation({gptr.region_id, gptr.offset});
-        if (!allocation.ok() || offset > allocation.value().bytes || bytes > allocation.value().bytes - offset)
-            return allocation.ok() ? CL_INVALID_ARGUMENT : ToCStatus(allocation.status());
-        auto address = runtime->loommem.ResolveLocal({gptr.region_id, gptr.offset});
-        if (!address.ok()) return ToCStatus(address.status());
-        std::memcpy(out_bytes, static_cast<std::byte*>(address.value()) + offset, bytes);
-        return CL_OK;
-    }
     auto result = runtime->loommem.AcquireReadRange({gptr.region_id, gptr.offset}, offset, bytes,
-                                                     timeout_ms, cxloom::loommem::ReadConsistency::kPerBlock);
+                                                     timeout_ms);
     if (!result.ok()) return ToCStatus(result.status());
     std::memcpy(out_bytes, result.value().data(), bytes);
     return CL_OK;
@@ -422,17 +408,8 @@ extern "C" cl_status_t cl_mem_read(cl_runtime_t* runtime, cl_gptr_t gptr, size_t
 extern "C" cl_status_t cl_mem_write(cl_runtime_t* runtime, cl_gptr_t gptr, size_t offset,
                                       const void* bytes, size_t byte_count, uint64_t timeout_ms) {
     if (!runtime || !bytes || byte_count == 0 || timeout_ms == 0) return CL_INVALID_ARGUMENT;
-    if (runtime->config.host_count <= 1) {
-        auto allocation = runtime->loommem.DescribeSharedAllocation({gptr.region_id, gptr.offset});
-        if (!allocation.ok() || offset > allocation.value().bytes || byte_count > allocation.value().bytes - offset)
-            return allocation.ok() ? CL_INVALID_ARGUMENT : ToCStatus(allocation.status());
-        auto address = runtime->loommem.ResolveLocal({gptr.region_id, gptr.offset});
-        if (!address.ok()) return ToCStatus(address.status());
-        std::memcpy(static_cast<std::byte*>(address.value()) + offset, bytes, byte_count);
-        return CL_OK;
-    }
     auto result = runtime->loommem.AcquireWriteRange({gptr.region_id, gptr.offset}, offset, byte_count,
-                                                      timeout_ms, cxloom::loommem::WriteAtomicity::kPerBlock);
+                                                      timeout_ms);
     if (!result.ok()) return ToCStatus(result.status());
     std::memcpy(result.value().data(), bytes, byte_count);
     return ToCStatus(runtime->loommem.ReleaseWriteBuffer(result.value()));

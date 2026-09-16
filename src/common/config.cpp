@@ -14,6 +14,9 @@ Status ConfigValidator::Validate(const CxloomConfig& config) {
     if (config.host_count > kMaxHosts) {
         return Status::InvalidArgument("host_count exceeds the bootstrap host table capacity");
     }
+    if (config.shared_region_path.empty()) {
+        return Status::InvalidArgument("shared_region_path must name a shared CXL device or test file");
+    }
     if (config.shared_region_bytes == 0) {
         return Status::InvalidArgument("shared region size must be non-zero");
     }
@@ -23,10 +26,6 @@ Status ConfigValidator::Validate(const CxloomConfig& config) {
     if ((config.coherence_granule_bytes & (config.coherence_granule_bytes - 1)) != 0 ||
         config.coherence_granule_bytes < 64) {
         return Status::InvalidArgument("coherence_granule_bytes must be a power of two and at least 64 bytes");
-    }
-    if (config.default_coherence_granularity != CoherenceGranularity::kObject &&
-        config.default_coherence_granularity != CoherenceGranularity::kFixedBlock) {
-        return Status::InvalidArgument("default coherence granularity is invalid");
     }
     if (config.replica_cache_capacity_entries == 0 || config.replica_cache_capacity_bytes == 0) {
         return Status::InvalidArgument("replica cache entry and byte capacities must be non-zero");

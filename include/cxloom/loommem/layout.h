@@ -32,7 +32,7 @@ struct SharedRegionLayout {
 };
 
 inline constexpr std::uint64_t kBootstrapMagic = 0x43584c4f4f4d424dULL; // "CXLOOMBM"
-inline constexpr std::uint32_t kBootstrapLayoutVersion = 9;
+inline constexpr std::uint32_t kBootstrapLayoutVersion = 11;
 
 enum class BootstrapState : std::uint32_t {
     kUninitialized = 0,
@@ -75,23 +75,6 @@ struct alignas(64) BootstrapHeader {
     std::atomic<std::uint32_t> joined_hosts {0};
     std::uint32_t reserved3 {0};
     std::array<HostRegistration, kMaxHosts> hosts {};
-};
-
-struct ObjectMetadata {
-    ObjectId object_id {0};
-    GlobalPointer base {};
-    std::size_t bytes {0};
-    Version global_version {0};
-    HostId token_owner {0};
-    std::uint32_t flags {0};
-};
-
-struct ReplicaMetadata {
-    ObjectId object_id {0};
-    void* local_addr {nullptr};
-    Version local_version {0};
-    bool cached {false};
-    bool dirty {false};
 };
 
 SharedRegionLayout BuildDefaultLayout(std::size_t total_bytes);

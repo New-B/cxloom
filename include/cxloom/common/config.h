@@ -9,20 +9,12 @@
 
 namespace cxloom {
 
-enum class CoherenceGranularity : std::uint8_t {
-    kObject = 0,
-    kFixedBlock = 1,
-};
-
 struct CxloomConfig {
     HostId local_host_id {0};
     std::uint16_t host_count {1};
 
     std::size_t shared_region_bytes {1ULL << 30};
-    // Legacy process-private placement heuristic; ignored by the shared global allocator.
-    std::size_t per_host_extent_bytes {1ULL << 28};
     std::size_t coherence_granule_bytes {4096};
-    CoherenceGranularity default_coherence_granularity {CoherenceGranularity::kObject};
     // Zero selects the largest capacity up to 1024 that fits all directed
     // host-pair queues in the reserved queue region.
     std::size_t queue_capacity_entries {0};
@@ -31,8 +23,8 @@ struct CxloomConfig {
     std::size_t replica_cache_capacity_entries {1024};
     std::size_t replica_cache_capacity_bytes {64ULL << 20};
 
-    // Empty selects a process-private anonymous mapping for unit tests.
-    // A devdax path such as /dev/dax0.0 selects a shared CXL mapping.
+    // Required shared CXL device path (for example /dev/dax0.0).
+    // Tests may use a regular file with the same shared mapping path.
     std::string shared_region_path;
     bool bootstrap_owner {false};
     bool create_region_file {false};

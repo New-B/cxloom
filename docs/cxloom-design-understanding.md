@@ -84,9 +84,8 @@ Global metadata in shared CXL memory:
 
 - object/block offset and size
 - allocation state
-- generation
-- version
-- token owner
+- per-block content version and writeback epoch
+- per-block token owner
 - global flags
 - communication structures
 
@@ -94,7 +93,7 @@ Local metadata in each host's DRAM:
 
 - replica local address
 - cached / dirty state
-- local version
+- local block version
 - optional residency / hotness information
 - local token-related transient state
 
@@ -120,7 +119,7 @@ Separation of concerns:
 
 ### 3.5 Dynamic Token Ownership
 
-Per shared block/object:
+Per shared coherence block:
 
 - there is exactly one token
 - token ownership is exclusive
@@ -145,7 +144,7 @@ Readers do not need the token.
 Expected flow:
 
 - on read, use local replica if present
-- compare `local_version` and `global_version`
+- compare the cached and shared versions of the same block
 - if equal, read locally
 - if stale, invalidate/reload from CXL and refresh local version
 
@@ -220,7 +219,10 @@ Candidates include:
 - `4KB`
 - `16KB`
 
-The design currently leans toward block/object-granular coherence, with `4KB` as a practical V1 starting point.
+Objects define allocation and reclamation lifetimes. Fixed-size blocks define
+coherence and caching, with `4KB` as the default starting point. Applications
+choose object boundaries. Multi-block operations provide per-block consistency;
+applications coordinate any cross-block invariants.
 
 Allocator design is separated from coherence-token design. The current shared
 allocator keeps address-ordered extent indexes in allocator metadata, with

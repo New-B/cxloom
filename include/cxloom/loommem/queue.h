@@ -89,6 +89,10 @@ public:
   Status TryPop(QueueEnvelope *message, bool *popped);
   Result<QueueEnvelope> Pop();
   Result<std::size_t> Size() const;
+  // Consumer cursor is a completion watermark only when sampled by the poller
+  // after its message handler has returned.
+  std::uint64_t PublishedSequence() const;
+  std::uint64_t ConsumedSequence() const;
   std::size_t capacity() const;
   HostId producer() const;
   HostId consumer() const;

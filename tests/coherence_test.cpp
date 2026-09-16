@@ -108,19 +108,19 @@ int main() {
     auto reader2 = std::async(std::launch::async, [&] { return host2.AcquireReadSnapshot(object.value(), 2000); });
     const auto first_read1 = reader1.get();
     const auto first_read2 = reader2.get();
-    passed = passed && first_read1.ok() && first_read2.ok() && first_read1.value().version == 1 &&
-             first_read2.value().version == 1 && Valid(first_read1.value(), 1, 0) && Valid(first_read2.value(), 1, 0);
+    passed = passed && first_read1.ok() && first_read2.ok() && first_read1.value().block_versions.at(0) == 1 &&
+             first_read2.value().block_versions.at(0) == 1 && Valid(first_read1.value(), 1, 0) && Valid(first_read2.value(), 1, 0);
 
     auto second_write = host1.AcquireWriteBuffer(object.value(), 2000);
     passed = passed && second_write.ok() && Store(second_write.value(), MakeRecord(2, 1));
     // A buffered writer only owns a private copy until release. Readers should
     // continue to see the last committed version while that token is held.
     auto concurrent_reader = host2.AcquireReadSnapshot(object.value(), 2000);
-    passed = passed && concurrent_reader.ok() && concurrent_reader.value().version == 1 &&
+    passed = passed && concurrent_reader.ok() && concurrent_reader.value().block_versions.at(0) == 1 &&
              Valid(concurrent_reader.value(), 1, 0);
     passed = passed && host1.ReleaseWriteBuffer(second_write.value()).ok();
     const auto refreshed = host2.AcquireReadSnapshot(object.value(), 2000);
-    passed = passed && refreshed.ok() && refreshed.value().version == 2 && Valid(refreshed.value(), 2, 1) &&
+    passed = passed && refreshed.ok() && refreshed.value().block_versions.at(0) == 2 && Valid(refreshed.value(), 2, 1) &&
              Valid(first_read2.value(), 1, 0);
 
     std::vector<std::future<cxloom::Result<cxloom::loommem::ReadSnapshot>>> readers;
@@ -129,12 +129,12 @@ int main() {
             std::async(std::launch::async, [&] { return host2.AcquireReadSnapshot(object.value(), 2000); }));
     for (auto& reader : readers) {
         const auto snapshot = reader.get();
-        passed = passed && snapshot.ok() && snapshot.value().version == 2 && Valid(snapshot.value(), 2, 1) &&
+        passed = passed && snapshot.ok() && snapshot.value().block_versions.at(0) == 2 && Valid(snapshot.value(), 2, 1) &&
                  snapshot.value().storage == refreshed.value().storage;
     }
 
     const auto host0_refreshed = host0.AcquireReadSnapshot(object.value(), 2000);
-    passed = passed && host0_refreshed.ok() && host0_refreshed.value().version == 2 &&
+    passed = passed && host0_refreshed.ok() && host0_refreshed.value().block_versions.at(0) == 2 &&
              Valid(host0_refreshed.value(), 2, 1);
 
     auto held_write = host0.AcquireWriteBuffer(object.value(), 2000);
@@ -163,10 +163,10 @@ int main() {
                                     ? host2.AcquireReadSnapshot(second_object.value(), 2000)
                                     : cxloom::Result<cxloom::loommem::ReadSnapshot>(second_object.status());
     passed = passed && other_snapshot.ok() && host2.cached_replica_count() == 1 &&
-             host2.cached_replica_bytes() == sizeof(Record) && retained_snapshot.value().version == 5 &&
+             host2.cached_replica_bytes() == sizeof(Record) && retained_snapshot.value().block_versions.at(0) == 5 &&
              Valid(retained_snapshot.value(), 2, 1);
     const auto reloaded_snapshot = host2.AcquireReadSnapshot(object.value(), 2000);
-    passed = passed && reloaded_snapshot.ok() && reloaded_snapshot.value().version == 5 &&
+    passed = passed && reloaded_snapshot.ok() && reloaded_snapshot.value().block_versions.at(0) == 5 &&
              Valid(reloaded_snapshot.value(), 2, 1) && host2.cached_replica_count() == 1;
 
     // Retirement is coordinated with the current (remote) token owner. Any

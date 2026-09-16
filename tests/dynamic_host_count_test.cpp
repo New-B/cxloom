@@ -1,3 +1,4 @@
+#include "shared_region_fixture.h"
 #include <array>
 #include <cstddef>
 #include <iostream>
@@ -15,6 +16,7 @@ int main() {
         config.shared_region_bytes = 192ULL << 20;
         config.queue_capacity_entries = 0;
 
+        SharedRegionFixture region(config);
         cxloom::loommem::LoomMemRuntime runtime(config);
         const auto status = runtime.Initialize();
         if (!status.ok()) {

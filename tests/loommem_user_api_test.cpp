@@ -35,7 +35,6 @@ int main() {
     cxloom::AllocOptions options;
     options.bytes = 256;
     options.alignment = 64;
-    options.coherence_granularity = cxloom::CoherenceGranularity::kFixedBlock;
     options.coherence_block_bytes = 64;
     const auto object = cxloom::clAlloc(*host0.value(), options);
 
@@ -46,8 +45,7 @@ int main() {
     bool passed = initial.ok() && initial.value().Commit().ok();
 
     auto range = object.ok()
-                     ? cxloom::clWriteRange(*host1.value(), object.value(), 32, 128, 2000,
-                                            cxloom::WriteAtomicity::kWholeRange)
+                     ? cxloom::clWriteRange(*host1.value(), object.value(), 32, 128, 2000)
                      : cxloom::Result<cxloom::WriteView>(object.status());
     if (range.ok())
         std::fill_n(static_cast<std::byte*>(range.value().data()), range.value().size(), std::byte {0x22});
@@ -60,8 +58,7 @@ int main() {
     passed = passed && aborted.ok() && aborted.value().Abort().ok();
 
     const auto read = object.ok()
-                          ? cxloom::clReadRange(*host0.value(), object.value(), 0, 256, 2000,
-                                               cxloom::ReadConsistency::kWholeRange)
+                          ? cxloom::clReadRange(*host0.value(), object.value(), 0, 256, 2000)
                           : cxloom::Result<cxloom::ReadView>(object.status());
     passed = passed && read.ok() && read.value().size() == 256;
     if (read.ok()) {

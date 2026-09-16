@@ -50,19 +50,21 @@ cl_mem_free(runtime, object);
 cl_runtime_destroy(runtime);
 ```
 
-`cl_gptr_t` is a global offset-based handle, not a process-local virtual
-address. Future `cl_mem_*_acquire/release` calls will resolve it safely for
-read and write access under LoomMem's coherence rules.
+`cl_gptr_t` is a global offset-based handle. Applications access shared data
+through `cl_mem_read` and `cl_mem_write` under LoomMem's block-level coherence
+rules. LoomMem manages only global shared CXL memory; applications allocate
+private DRAM using standard system or language allocation APIs.
 
 ## Shared Region Bootstrap
 
-Set `cl_config_t.shared_region_path` to `/dev/dax0.0` on every logical host.
+`shared_region_path` is required. Set it to `/dev/dax0.0` on every logical
+host for CXL operation. Tests may provide a regular file, mapped with
+`MAP_SHARED`, to exercise the same allocator and protocol without CXL hardware.
 Exactly one host, normally host zero, sets `bootstrap_owner = 1`; all other
 hosts attach with `bootstrap_owner = 0`. The owner publishes the layout in a
 fixed bootstrap header at region offset zero, and attachers validate it before
 using the mapping. `cl_mem_resolve_local` is available for mapping tests; it
-does not provide coherence protection and must not replace future acquire/
-release APIs.
+does not provide coherence protection and must not replace the read/write APIs.
 
 ## Multi-Host Initialization Test
 
@@ -80,20 +82,23 @@ After launching the containers, run a concurrent shared-DAX initialization test:
 Host zero creates a fresh bootstrap session and initializes independent shared
 extent pools for object data and coherence sidecars.
 
-## Shared Allocator V1
+## Shared Allocator V2 (TLSF)
 
 For a shared DAX mapping, the bootstrap owner formats an allocator header in
-the allocator region. A shared, address-ordered extent index allocates, splits,
-returns, and coalesces free ranges. A self-describing metadata prefix exists
+the allocator region. TLSF-style shared size bins select free ranges without
+scanning the complete free list; an address-ordered index still supports
+splitting and coalescing. A self-describing metadata prefix exists
 immediately before an object only while that object is allocated.
 
 Shared allocation count has no per-host descriptor limit and is bounded by the
 shared-data and coherence-metadata regions. `cl_mem_free` retires and reuses an
 entire object after preventing new acquires and waiting for every host's active
 references and all writebacks to drain. Its data and sidecar extents then
-return independently to their free pools; a later allocation creates a new
-descriptor and a new allocation ID.
-ResolveLocal accepts only published allocation base pointers in shared mode;
+return independently to their free pools only after the all-host retirement
+protocol certifies that caches, accepted operations, and queue watermarks are
+drained. The object address is invalid immediately after free; using it again
+is an application error.
+ResolveLocal accepts only published allocation base pointers;
 arbitrary offsets and interior pointers are rejected. The bootstrap object's
 publication slots are bring-up/test coordination and are not a general-purpose
 object directory.
@@ -148,22 +153,25 @@ The public C++ memory API is collected in `cxloom/loommem.h`. Applications use
 aborts an active view on destruction. Runtime polling, token transfer,
 references, descriptors, and sidecars remain internal to this API.
 
-`AcquireWriteBuffer` and `ReleaseWriteBuffer` combine token ownership with
-version publication. `AcquireReadSnapshot` maintains an immutable host-local
-replica and refreshes it when the shared version advances. A descriptor
-coherence epoch prevents readers from accepting a concurrent partial
-writeback. See `docs/cxl-coherence.md`.
+Objects are the allocation, addressing, and reclamation unit. Fixed-size
+coherence blocks within each object are independent token, version, writeback,
+and replica-LRU units. The default block size is 4 KiB, with per-allocation
+block-size overrides. Small objects naturally occupy one block.
 
-The next coherence-granularity evolution separates allocation identity from
-block-level token, version, writeback, and replica state. The proposed metadata
-layout, range semantics, atomicity modes, allocator integration, and migration
-plan are specified in `docs/coherence-block-design.md`.
+`AcquireReadRange` and `AcquireWriteRange` accept byte ranges. Multi-block
+writers acquire tokens in ascending block order and publish each block
+independently. Readers validate each block's version and writeback epoch.
+`AcquireReadSnapshot` and `AcquireWriteBuffer`, like `clRead` and `clWrite`,
+cover the full object range with these same per-block guarantees. Multi-block
+reads are immutable results, not point-in-time snapshots of the object;
+applications synchronize cross-block invariants.
 
-Objects remain the allocation and reclamation unit. Within each object,
-configurable coherence blocks are independent token, version, writeback, and
-replica-LRU units. `AcquireReadRange` and `AcquireWriteRange` accept byte ranges;
-multi-block writers acquire tokens in ascending block order. The existing
-whole-object snapshot and write-buffer APIs wrap the full object range.
+See `docs/cxl-coherence.md` for the protocol and
+`docs/coherence-block-design.md` for metadata, range semantics, and lifecycle
+management. `docs/object-retirement.md` specifies the all-host closing,
+watermark draining, cleaning, and reclaimable phases. The current shared layout
+requires reinitializing older regions
+(bootstrap version 11, allocator version 11).
 
 Run the variable-scale devdax validation with:
 

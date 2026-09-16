@@ -79,8 +79,7 @@ Status LoomMemRuntime::Initialize() {
     }
     bootstrap_ = static_cast<BootstrapHeader*>(region_mapper_.base());
 
-    const bool initialize_bootstrap = !region_mapper_.is_shared() || config_.bootstrap_owner;
-    const auto bootstrap_status = initialize_bootstrap ? InitializeBootstrap() : AttachBootstrap();
+    const auto bootstrap_status = config_.bootstrap_owner ? InitializeBootstrap() : AttachBootstrap();
     if (!bootstrap_status.ok()) {
         bootstrap_ = nullptr;
         region_mapper_.Unmap();
@@ -102,20 +101,13 @@ Status LoomMemRuntime::Initialize() {
         return queue_region_status;
     }
 
-    if (region_mapper_.is_shared()) {
-        allocator_ = std::make_unique<SharedExtentAllocator>(allocator_header_, region_mapper_.base(),
-                                                           region_mapper_.bytes(), config_.local_host_id,
-                                                           layout_.shared_data.offset, layout_.shared_data.bytes,
-                                                           coherence_header_, config_.default_coherence_granularity,
-                                                           config_.coherence_granule_bytes);
-    } else {
-        allocator_ = std::make_unique<SlabExtentAllocator>(layout_.shared_data.bytes);
-    }
-    coherence_ = std::make_unique<TokenCoherenceManager>(config_.local_host_id);
+    allocator_ = std::make_unique<SharedExtentAllocator>(allocator_header_, region_mapper_.base(),
+                                                        region_mapper_.bytes(), config_.local_host_id,
+                                                        layout_.shared_data.offset, layout_.shared_data.bytes,
+                                                        coherence_header_, config_.coherence_granule_bytes);
 
     auto init_status = allocator_->Initialize();
     if (!init_status.ok()) {
-        coherence_.reset();
         allocator_.reset();
         allocator_header_ = nullptr;
         bootstrap_ = nullptr;
@@ -125,7 +117,6 @@ Status LoomMemRuntime::Initialize() {
 
     const auto registration_status = RegisterLocalHost();
     if (!registration_status.ok()) {
-        coherence_.reset();
         allocator_.reset();
         allocator_header_ = nullptr;
         bootstrap_ = nullptr;
@@ -145,7 +136,6 @@ Status LoomMemRuntime::Initialize() {
             const auto storage = LocateSharedQueue(queue_region, layout_.queues.bytes, producer, consumer);
             if (!storage.ok()) {
                 queues_.clear();
-                coherence_.reset();
                 allocator_.reset();
                 allocator_header_ = nullptr;
                 bootstrap_ = nullptr;
@@ -156,19 +146,18 @@ Status LoomMemRuntime::Initialize() {
         }
     }
 
-    if (region_mapper_.is_shared()) {
-        auto* shared_allocator = dynamic_cast<SharedExtentAllocator*>(allocator_.get());
-        token_service_ = std::make_unique<TokenService>(
-            config_.local_host_id, shared_allocator, region_mapper_.base(),
-            [this](HostId producer, HostId consumer) { return GetQueue(producer, consumer); });
-    }
+    token_service_ = std::make_unique<TokenService>(
+        config_.local_host_id, allocator_.get(), region_mapper_.base(),
+        [this](HostId producer, HostId consumer) { return GetQueue(producer, consumer); });
 
     initialized_ = true;
-    Trace("loommem", region_mapper_.is_shared() ? "initialized shared CXL region" : "initialized private test region");
+    Trace("loommem", "initialized shared CXL region");
     return Status::Ok();
 }
 
 Status LoomMemRuntime::Finalize() {
+    if (initialized_ && allocator_->Retirement().phase != RetirementPhase::kIdle)
+        return Status::FailedPrecondition("finish the shared retirement transaction before finalizing LoomMem");
     if (staged_write_count())
         return Status::FailedPrecondition("publish staged writes before finalizing LoomMem");
     initialized_ = false;
@@ -182,7 +171,6 @@ Status LoomMemRuntime::Finalize() {
         replica_access_clock_ = 0;
     }
     queues_.clear();
-    coherence_.reset();
     allocator_.reset();
     bootstrap_ = nullptr;
     allocator_header_ = nullptr;
@@ -195,7 +183,7 @@ Status LoomMemRuntime::Finalize() {
 }
 
 Result<GlobalPointer> LoomMemRuntime::AllocateShared(std::size_t bytes, std::size_t alignment) {
-    return AllocateShared(AllocationOptions {bytes, alignment, config_.default_coherence_granularity,
+    return AllocateShared(AllocationOptions {bytes, alignment,
                                              config_.coherence_granule_bytes});
 }
 
@@ -203,100 +191,99 @@ Result<GlobalPointer> LoomMemRuntime::AllocateShared(const AllocationOptions& op
     if (!initialized_) {
         return Status::FailedPrecondition("LoomMem runtime must be initialized before allocation");
     }
-    auto* shared_allocator = dynamic_cast<SharedExtentAllocator*>(allocator_.get());
-    auto result = shared_allocator == nullptr ? allocator_->Allocate(options.bytes, options.alignment)
-                                              : shared_allocator->Allocate(options);
-    if (!result.ok()) {
+    const auto result = allocator_->Allocate(options);
+    if (!result.ok())
         return result.status();
-    }
-    if (!region_mapper_.is_shared()) {
-        result.value().offset += layout_.shared_data.offset;
-    } else if (token_service_ != nullptr) {
-        const auto token_status = token_service_->RegisterAllocation(result.value());
-        if (!token_status.ok())
-            return token_status;
-    }
+    const auto token_status = token_service_->RegisterAllocation(result.value());
+    if (!token_status.ok())
+        return token_status;
     return result.value();
 }
 
 Status LoomMemRuntime::FreeShared(GlobalPointer gptr) {
-    if (!initialized_) {
-        return Status::FailedPrecondition("LoomMem runtime must be initialized before free");
-    }
-    if (gptr.region_id != 0 || gptr.offset < layout_.shared_data.offset ||
-        gptr.offset >= layout_.shared_data.offset + layout_.shared_data.bytes) {
-        return Status::InvalidArgument("global pointer does not refer to the shared-data region");
-    }
-    if (!region_mapper_.is_shared()) {
-        gptr.offset -= layout_.shared_data.offset;
-        return allocator_->Free(gptr);
-    }
-    auto* shared_allocator = dynamic_cast<SharedExtentAllocator*>(allocator_.get());
-    const auto allocation = shared_allocator->Describe(gptr);
-    if (!allocation.ok())
-        return allocation.status();
-    const auto descriptor_result = shared_allocator->MutableDescriptor(gptr);
-    if (!descriptor_result.ok())
-        return descriptor_result.status();
-    auto* descriptor = descriptor_result.value();
-    const auto retire_status = token_service_->PrepareRetire(gptr, config_.bootstrap_timeout_ms);
-    if (!retire_status.ok())
-        return retire_status;
-    const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::milliseconds(config_.bootstrap_timeout_ms);
-    while (true) {
-        bool quiescent = true;
-        for (HostId host = 0; host < config_.host_count; ++host) {
-            if (descriptor->active_references[host].load(std::memory_order_acquire) != 0) {
-                quiescent = false;
-                break;
+    if (!initialized_)
+        return Status::FailedPrecondition("runtime must be initialized before free");
+    // One caller drives a transaction on this host; timeout leaves it resumable.
+    std::unique_lock<std::mutex> coordinator(retirement_mutex_, std::try_to_lock);
+    if (!coordinator.owns_lock()) return Status::Unavailable("another local free is in progress");
+    if (config_.host_count > 1 && (queue_poller_ == nullptr || !queue_poller_->running()))
+        return Status::FailedPrecondition("multi-host retirement requires a running poller on every host");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(config_.bootstrap_timeout_ms);
+    bool began = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (!began) {
+            const auto transaction = allocator_->BeginRetire(gptr, config_.host_count);
+            if (!transaction.ok()) {
+                if (transaction.status().code() != StatusCode::kUnavailable) return transaction.status();
+                std::this_thread::yield();
+                continue;
             }
+            began = true;
         }
-        for (std::uint64_t block = 0; quiescent && block < descriptor->coherence_block_count; ++block) {
-            auto* metadata = reinterpret_cast<CoherenceBlockDescriptor*>(
-                static_cast<std::byte*>(region_mapper_.base()) + descriptor->coherence_metadata_offset) + block;
-            if ((metadata->writeback_epoch.load(std::memory_order_acquire) & 1U) != 0)
-                quiescent = false;
+        // With no inbound channels there can be no message handler in flight.
+        if (config_.host_count == 1) {
+            const auto status = ProgressRetirement();
+            if (!status.ok()) return status;
         }
-        if (quiescent)
-            break;
-        if (std::chrono::steady_clock::now() >= deadline) {
-            shared_allocator->CancelRetire(descriptor, allocation.value().allocation_id);
-            return Status::Unavailable("timed out waiting for all hosts to release object references");
-        }
+        const auto transaction = allocator_->Retirement();
+        if (transaction.phase == RetirementPhase::kReclaimable)
+            return allocator_->Free(gptr);
+        if (queue_poller_ && !queue_poller_->running())
+            return Status::Unavailable("retirement retained after poller failure");
         std::this_thread::yield();
     }
-    const auto free_status = shared_allocator->Free(gptr);
-    if (!free_status.ok()) {
-        shared_allocator->CancelRetire(descriptor, allocation.value().allocation_id);
-        return free_status;
-    }
-    token_service_->ForgetAllocation(gptr, allocation.value().coherence_metadata_offset,
-                                     allocation.value().coherence_block_count);
-    std::lock_guard<std::mutex> lock(replicas_mutex_);
-    for (auto it = replicas_.begin(); it != replicas_.end();) {
-        if (it->second.object_offset == gptr.offset) {
-            cached_replica_bytes_ -= it->second.storage->size();
-            it = replicas_.erase(it);
-        } else {
-            ++it;
+    return Status::Unavailable(began
+        ? "retirement incomplete; object remains inaccessible and storage is not reusable"
+        : "timed out waiting for the shared retirement coordinator");
+}
+
+Status LoomMemRuntime::ProgressRetirement() {
+    const auto outbound = token_service_->ProgressOutbound();
+    if (!outbound.ok()) return outbound;
+    const auto transaction = allocator_->Retirement();
+    if (transaction.phase == RetirementPhase::kIdle || transaction.phase == RetirementPhase::kReclaimable ||
+        allocator_->RetirementAcknowledged(transaction, config_.local_host_id))
+        return Status::Ok();
+    std::array<std::uint64_t, kMaxHosts> cursors {};
+    if (transaction.phase == RetirementPhase::kClosing) {
+        if (!token_service_->CloseObject(transaction.object)) return Status::Ok();
+        for (HostId host = 0; host < config_.host_count; ++host)
+            if (host != config_.local_host_id)
+                cursors[host] = queues_[config_.local_host_id][host]->PublishedSequence();
+    } else if (transaction.phase == RetirementPhase::kDraining) {
+        // Called only after ScanOnce handlers return, never by the freeing
+        // thread in a multi-host runtime. A popped packet alone is insufficient.
+        for (HostId host = 0; host < config_.host_count; ++host)
+            if (host != config_.local_host_id)
+                cursors[host] = queues_[host][config_.local_host_id]->ConsumedSequence();
+    } else if (transaction.phase == RetirementPhase::kCleaning) {
+        const auto descriptor = allocator_->MutableDescriptor(transaction.object, true);
+        if (!descriptor.ok()) return descriptor.status();
+        token_service_->ForgetAllocation(transaction.object, descriptor.value()->coherence_metadata_offset,
+                                         descriptor.value()->coherence_block_count);
+        std::lock_guard<std::mutex> lock(replicas_mutex_);
+        for (auto it = replicas_.begin(); it != replicas_.end();) {
+            if (it->second.object_offset == transaction.object.offset) {
+                cached_replica_bytes_ -= it->second.storage->size();
+                it = replicas_.erase(it);
+            } else ++it;
         }
     }
-    return Status::Ok();
+    const auto status = allocator_->AcknowledgeRetirement(transaction, config_.local_host_id, cursors);
+    return status.code() == StatusCode::kUnavailable ? Status::Ok() : status;
 }
 
 Result<ObjectReference> LoomMemRuntime::AcquireObjectReference(GlobalPointer gptr) {
-    if (!initialized_ || !region_mapper_.is_shared())
+    if (!initialized_)
         return Status::FailedPrecondition("object references require an initialized shared runtime");
-    auto* allocator = dynamic_cast<SharedExtentAllocator*>(allocator_.get());
+    auto* allocator = allocator_.get();
     const auto descriptor = allocator->AcquireReference(gptr, config_.local_host_id);
     if (!descriptor.ok())
         return descriptor.status();
-    const auto allocation_id = descriptor.value()->allocation_id;
-    std::shared_ptr<void> guard(descriptor.value(), [allocator, allocation_id, host = config_.local_host_id](void* p) {
-        allocator->ReleaseReference(static_cast<AllocationDescriptor*>(p), allocation_id, host);
+    std::shared_ptr<void> guard(descriptor.value(), [allocator, host = config_.local_host_id](void* p) {
+        allocator->ReleaseReference(static_cast<AllocationDescriptor*>(p), host);
     });
-    return ObjectReference {gptr, allocation_id, std::move(guard)};
+    return ObjectReference {gptr, std::move(guard)};
 }
 
 Result<void*> LoomMemRuntime::ResolveLocal(const GlobalPointer& gptr) const {
@@ -307,11 +294,9 @@ Result<void*> LoomMemRuntime::ResolveLocal(const GlobalPointer& gptr) const {
         gptr.offset >= layout_.shared_data.offset + layout_.shared_data.bytes) {
         return Status::InvalidArgument("global pointer is outside the mapped shared region");
     }
-    if (region_mapper_.is_shared()) {
-        const auto allocation = DescribeSharedAllocation(gptr);
-        if (!allocation.ok())
-            return allocation.status();
-    }
+    const auto allocation = DescribeSharedAllocation(gptr);
+    if (!allocation.ok())
+        return allocation.status();
     auto* base = static_cast<std::byte*>(region_mapper_.base());
     return base + gptr.offset;
 }
@@ -319,20 +304,14 @@ Result<void*> LoomMemRuntime::ResolveLocal(const GlobalPointer& gptr) const {
 Result<AllocationInfo> LoomMemRuntime::DescribeSharedAllocation(GlobalPointer gptr) const {
     if (!initialized_)
         return Status::FailedPrecondition("runtime is not initialized");
-    const auto* allocator = dynamic_cast<const SharedExtentAllocator*>(allocator_.get());
-    if (allocator == nullptr) {
-        return Status::FailedPrecondition("allocation descriptors require a shared runtime");
-    }
+    const auto* allocator = allocator_.get();
     return allocator->Describe(gptr);
 }
 
 Result<HostId> LoomMemRuntime::ResolveOwningHost(GlobalPointer gptr) const {
     if (!initialized_)
         return Status::FailedPrecondition("runtime is not initialized");
-    const auto* allocator = dynamic_cast<const SharedExtentAllocator*>(allocator_.get());
-    if (allocator == nullptr) {
-        return Status::FailedPrecondition("allocation ownership requires a shared runtime");
-    }
+    const auto* allocator = allocator_.get();
     return allocator->OwningHost(gptr);
 }
 
@@ -539,15 +518,7 @@ std::uint64_t LoomMemRuntime::visibility_error_count() const {
 }
 
 Result<HostId> LoomMemRuntime::ResolvePreferredHost(const GlobalPointer& gptr) const {
-    if (config_.host_count == 0)
-        return Status::FailedPrecondition("host_count is zero");
-    if (region_mapper_.is_shared())
-        return ResolveOwningHost(gptr);
-    if (gptr.offset < layout_.shared_data.offset) {
-        return Status::InvalidArgument("global pointer is outside the shared-data region");
-    }
-    return static_cast<HostId>(((gptr.offset - layout_.shared_data.offset) / config_.per_host_extent_bytes) %
-                               config_.host_count);
+    return ResolveOwningHost(gptr);
 }
 
 Result<SpscQueue*> LoomMemRuntime::GetQueue(HostId producer, HostId consumer) {
@@ -575,9 +546,7 @@ Status LoomMemRuntime::StartQueuePoller(QueueMessageHandler handler, QueuePoller
     auto dispatch = [this, application_handler = std::move(handler)](QueueEnvelope message) mutable {
         if (message.header.kind == MessageKind::kTokenReq || message.header.kind == MessageKind::kTokenGrant ||
             message.header.kind == MessageKind::kTokenReject || message.header.kind == MessageKind::kTokenCancel ||
-            message.header.kind == MessageKind::kTokenCancelAck ||
-            message.header.kind == MessageKind::kTokenRetire ||
-            message.header.kind == MessageKind::kTokenRetireAck) {
+            message.header.kind == MessageKind::kTokenCancelAck) {
             if (token_service_ == nullptr)
                 return Status::FailedPrecondition("token message received without a token service");
             return token_service_->HandleMessage(message);
@@ -587,7 +556,7 @@ Status LoomMemRuntime::StartQueuePoller(QueueMessageHandler handler, QueuePoller
         return application_handler(std::move(message));
     };
     queue_poller_ = std::make_unique<QueuePoller>(config_.local_host_id, std::move(inbound_queues),
-                                                  std::move(dispatch), options);
+                                                  std::move(dispatch), options, [this] { return ProgressRetirement(); });
     const auto status = queue_poller_->Start();
     if (!status.ok())
         queue_poller_.reset();
@@ -664,7 +633,7 @@ void LoomMemRuntime::EvictReplicasLocked() {
 }
 
 void LoomMemRuntime::CacheReplica(std::uint64_t cache_key, std::uint64_t object_offset,
-                                  std::uint64_t block_index, std::uint64_t allocation_id, Version version,
+                                  std::uint64_t block_index, Version version,
                                   std::shared_ptr<const std::vector<std::byte>> storage) {
     std::lock_guard<std::mutex> lock(replicas_mutex_);
     const auto existing = replicas_.find(cache_key);
@@ -673,53 +642,44 @@ void LoomMemRuntime::CacheReplica(std::uint64_t cache_key, std::uint64_t object_
         replicas_.erase(existing);
     }
     cached_replica_bytes_ += storage->size();
-    replicas_.emplace(cache_key, CachedReplica {object_offset, block_index, allocation_id, version,
+    replicas_.emplace(cache_key, CachedReplica {object_offset, block_index, version,
                                                 std::move(storage), ++replica_access_clock_});
     EvictReplicasLocked();
 }
 
 Result<ReadSnapshot> LoomMemRuntime::AcquireReadSnapshot(GlobalPointer object, std::uint64_t timeout_ms) {
+    const auto reference = AcquireObjectReference(object);
+    if (!reference.ok()) return reference.status();
     const auto allocation = DescribeSharedAllocation(object);
     if (!allocation.ok())
         return allocation.status();
-    return AcquireReadRange(object, 0, allocation.value().bytes, timeout_ms, ReadConsistency::kWholeRange);
+    return AcquireReadRange(object, 0, allocation.value().bytes, timeout_ms);
 }
 
 Result<ReadSnapshot> LoomMemRuntime::AcquireReadRange(GlobalPointer object, std::uint64_t offset,
-                                                       std::uint64_t bytes, std::uint64_t timeout_ms,
-                                                       ReadConsistency consistency) {
-    if (!initialized_ || !region_mapper_.is_shared() || timeout_ms == 0)
+                                                       std::uint64_t bytes, std::uint64_t timeout_ms) {
+    if (!initialized_ || timeout_ms == 0)
         return Status::FailedPrecondition("read ranges require an initialized shared runtime and timeout");
-    auto* allocator = dynamic_cast<SharedExtentAllocator*>(allocator_.get());
-    if (allocator == nullptr)
-        return Status::FailedPrecondition("read snapshots require the shared allocator");
+    auto* allocator = allocator_.get();
     const auto descriptor_result = allocator->AcquireReference(object, config_.local_host_id);
     if (!descriptor_result.ok())
         return descriptor_result.status();
     auto* descriptor = descriptor_result.value();
-    const auto reference_id = descriptor->allocation_id;
     std::shared_ptr<void> reference_guard(
-        descriptor, [allocator, reference_id, host = config_.local_host_id](void* p) {
-            allocator->ReleaseReference(static_cast<AllocationDescriptor*>(p), reference_id, host);
+        descriptor, [allocator, host = config_.local_host_id](void* p) {
+            allocator->ReleaseReference(static_cast<AllocationDescriptor*>(p), host);
         });
     if (bytes == 0 || offset > descriptor->bytes || bytes > descriptor->bytes - offset)
         return Status::InvalidArgument("read range is empty or outside the allocation");
     const auto first_block = offset / descriptor->coherence_block_bytes;
     const auto last_block = (offset + bytes - 1) / descriptor->coherence_block_bytes;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-    const auto allocation_id = descriptor->allocation_id;
-    while (std::chrono::steady_clock::now() < deadline) {
-    const auto range_epoch_before = descriptor->range_commit_epoch.load(std::memory_order_acquire);
-    if (consistency == ReadConsistency::kWholeRange && (range_epoch_before & 1U) != 0) {
-        std::this_thread::yield();
-        continue;
-    }
     auto assembled = std::make_shared<std::vector<std::byte>>(bytes);
     std::shared_ptr<const std::vector<std::byte>> single_block_replica;
     std::vector<Version> versions;
     versions.reserve(last_block - first_block + 1);
     for (std::uint64_t index = first_block; index <= last_block; ++index) {
-        const auto block_result = allocator->MutableCoherenceBlock(object, index);
+        const auto block_result = allocator->MutableCoherenceBlock(object, index, true);
         if (!block_result.ok())
             return block_result.status();
         auto* block = block_result.value();
@@ -741,8 +701,8 @@ Result<ReadSnapshot> LoomMemRuntime::AcquireReadRange(GlobalPointer object, std:
             {
                 std::lock_guard<std::mutex> lock(replicas_mutex_);
                 const auto cached = replicas_.find(cache_key);
-                if (cached != replicas_.end() && cached->second.allocation_id == allocation_id &&
-                    cached->second.version == version_before) {
+                if (cached != replicas_.end() && cached->second.object_offset == object.offset &&
+                    cached->second.block_index == index && cached->second.version == version_before) {
                     cached->second.last_access = ++replica_access_clock_;
                     replica = cached->second.storage;
                     accepted_version = version_before;
@@ -763,15 +723,13 @@ Result<ReadSnapshot> LoomMemRuntime::AcquireReadRange(GlobalPointer object, std:
                 return verify_status;
             const auto epoch_after = block->writeback_epoch.load(std::memory_order_acquire);
             const auto version_after = block->version.load(std::memory_order_acquire);
-            if (epoch_before != epoch_after || (epoch_after & 1U) != 0 || version_before != version_after ||
-                allocation_id != descriptor->allocation_id ||
-                descriptor->state.load(std::memory_order_acquire) != static_cast<std::uint32_t>(AllocationState::kAllocated)) {
+            if (epoch_before != epoch_after || (epoch_after & 1U) != 0 || version_before != version_after) {
                 std::this_thread::yield();
                 continue;
             }
             replica = std::move(refreshed);
             accepted_version = version_after;
-            CacheReplica(cache_key, object.offset, index, allocation_id, version_after, replica);
+            CacheReplica(cache_key, object.offset, index, version_after, replica);
             break;
         }
         if (replica == nullptr)
@@ -786,61 +744,32 @@ Result<ReadSnapshot> LoomMemRuntime::AcquireReadRange(GlobalPointer object, std:
     }
     std::shared_ptr<const std::vector<std::byte>> result_storage =
         single_block_replica == nullptr ? std::move(assembled) : std::move(single_block_replica);
-    if (consistency == ReadConsistency::kWholeRange) {
-        bool stable = true;
-        for (std::uint64_t index = first_block; index <= last_block; ++index) {
-            const auto block_result = allocator->MutableCoherenceBlock(object, index);
-            if (!block_result.ok())
-                return block_result.status();
-            const auto acquire_status = AcquireData(block_result.value(), sizeof(CoherenceBlockDescriptor),
-                                                    VisibilityMode::kReleaseAcquire);
-            if (!acquire_status.ok())
-                return acquire_status;
-            const auto vector_index = index - first_block;
-            if ((block_result.value()->writeback_epoch.load(std::memory_order_acquire) & 1U) != 0 ||
-                block_result.value()->version.load(std::memory_order_acquire) != versions[vector_index]) {
-                stable = false;
-                break;
-            }
-        }
-        const auto range_epoch_after = descriptor->range_commit_epoch.load(std::memory_order_acquire);
-        if (!stable || range_epoch_before != range_epoch_after || (range_epoch_after & 1U) != 0 ||
-            descriptor->allocation_id != allocation_id) {
-            std::this_thread::yield();
-            continue;
-        }
-    }
-    return ReadSnapshot {object, offset, allocation_id, descriptor->object_version.load(std::memory_order_acquire),
-                         std::move(versions), std::move(result_storage)};
-    }
-    return Status::Unavailable("timed out waiting for a stable whole-range snapshot");
+    return ReadSnapshot {object, offset, std::move(versions), std::move(result_storage)};
 }
 
 Result<WriteBuffer> LoomMemRuntime::AcquireWriteBuffer(GlobalPointer object, std::uint64_t timeout_ms) {
+    const auto reference = AcquireObjectReference(object);
+    if (!reference.ok()) return reference.status();
     const auto allocation = DescribeSharedAllocation(object);
     if (!allocation.ok())
         return allocation.status();
-    return AcquireWriteRange(object, 0, allocation.value().bytes, timeout_ms, WriteAtomicity::kWholeRange);
+    return AcquireWriteRange(object, 0, allocation.value().bytes, timeout_ms);
 }
 
 Result<WriteBuffer> LoomMemRuntime::AcquireWriteRange(GlobalPointer object, std::uint64_t offset,
-                                                       std::uint64_t bytes, std::uint64_t timeout_ms,
-                                                       WriteAtomicity atomicity) {
+                                                       std::uint64_t bytes, std::uint64_t timeout_ms) {
     if (!initialized_ || token_service_ == nullptr || timeout_ms == 0)
         return Status::FailedPrecondition("write buffers require an initialized shared runtime");
     // Buffered writers do not touch shared bytes until release, so holding the
     // token alone must not make the last committed version unreadable.
-    auto* shared_allocator = dynamic_cast<SharedExtentAllocator*>(allocator_.get());
-    if (shared_allocator == nullptr)
-        return Status::FailedPrecondition("write ranges require the shared allocator");
+    auto* shared_allocator = allocator_.get();
     const auto descriptor_result = shared_allocator->AcquireReference(object, config_.local_host_id);
     if (!descriptor_result.ok())
         return descriptor_result.status();
     auto* descriptor = descriptor_result.value();
-    const auto allocation_id = descriptor->allocation_id;
     std::shared_ptr<void> reference_guard(
-        descriptor, [shared_allocator, allocation_id, host = config_.local_host_id](void* p) {
-            shared_allocator->ReleaseReference(static_cast<AllocationDescriptor*>(p), allocation_id, host);
+        descriptor, [shared_allocator, host = config_.local_host_id](void* p) {
+            shared_allocator->ReleaseReference(static_cast<AllocationDescriptor*>(p), host);
         });
     const auto allocation = shared_allocator->Describe(object);
     if (!allocation.ok())
@@ -880,47 +809,25 @@ Result<WriteBuffer> LoomMemRuntime::AcquireWriteRange(GlobalPointer object, std:
         return data_status;
     }
     std::memcpy(storage->data(), static_cast<std::byte*>(region_mapper_.base()) + object.offset + offset, bytes);
-    return WriteBuffer {leases.front(), leases, offset, std::move(storage), std::move(reference_guard), atomicity};
+    return WriteBuffer {leases.front(), leases, offset, std::move(storage), std::move(reference_guard)};
 }
 
 Status LoomMemRuntime::ReleaseWriteBuffer(const WriteBuffer& write) {
-    if (!initialized_ || write.storage == nullptr)
+    if (!initialized_ || write.storage == nullptr || !write.reference_guard)
         return Status::FailedPrecondition("write buffer requires an initialized runtime and storage");
-    auto* shared_allocator = dynamic_cast<SharedExtentAllocator*>(allocator_.get());
+    auto* shared_allocator = allocator_.get();
     const auto descriptor_result = shared_allocator->MutableDescriptor(write.lease.object, true);
     if (!descriptor_result.ok())
         return descriptor_result.status();
     auto* descriptor = descriptor_result.value();
     const auto& leases = write.leases.empty() ? std::vector<TokenLease> {write.lease} : write.leases;
-    if (descriptor->allocation_id != write.lease.allocation_id || write.offset > descriptor->bytes ||
+    if (write.offset > descriptor->bytes ||
         write.storage->size() > descriptor->bytes - write.offset)
         return Status::FailedPrecondition("write buffer does not match the shared allocation");
-    std::uint64_t range_epoch = 0;
-    if (write.atomicity == WriteAtomicity::kWholeRange) {
-        while (true) {
-            range_epoch = descriptor->range_commit_epoch.load(std::memory_order_acquire);
-            if ((range_epoch & 1U) != 0) {
-                std::this_thread::yield();
-                continue;
-            }
-            if (descriptor->range_commit_epoch.compare_exchange_weak(
-                    range_epoch, range_epoch + 1, std::memory_order_acq_rel, std::memory_order_acquire))
-                break;
-        }
-        const auto epoch_status = PublishData(descriptor, sizeof(*descriptor), VisibilityMode::kReleaseAcquire);
-        if (!epoch_status.ok()) {
-            descriptor->range_commit_epoch.store(range_epoch + 2, std::memory_order_release);
-            for (const auto& lease : leases)
-                token_service_->Release(lease, false);
-            return epoch_status;
-        }
-    }
     for (std::size_t lease_index = 0; lease_index < leases.size(); ++lease_index) {
         const auto& lease = leases[lease_index];
         const auto begin_status = token_service_->BeginWriteback(lease);
         if (!begin_status.ok()) {
-            if (write.atomicity == WriteAtomicity::kWholeRange)
-                descriptor->range_commit_epoch.store(range_epoch + 2, std::memory_order_release);
             for (std::size_t remaining = lease_index; remaining < leases.size(); ++remaining)
                 token_service_->Release(leases[remaining], false);
             return begin_status;
@@ -933,37 +840,17 @@ Status LoomMemRuntime::ReleaseWriteBuffer(const WriteBuffer& write) {
                     write.storage->data() + (copy_begin - write.offset), copy_end - copy_begin);
         const auto release_status = ReleaseWriteToken(lease);
         if (!release_status.ok()) {
-            if (write.atomicity == WriteAtomicity::kWholeRange)
-                descriptor->range_commit_epoch.store(range_epoch + 2, std::memory_order_release);
             for (std::size_t remaining = lease_index + 1; remaining < leases.size(); ++remaining)
                 token_service_->Release(leases[remaining], false);
             return release_status;
         }
-    }
-    descriptor->object_version.fetch_add(1, std::memory_order_acq_rel);
-    if (write.atomicity == WriteAtomicity::kWholeRange)
-        descriptor->range_commit_epoch.store(range_epoch + 2, std::memory_order_release);
-    const auto publish_status = PublishData(descriptor, sizeof(*descriptor),
-                                            VisibilityMode::kReleaseAcquire);
-    if (!publish_status.ok())
-        return publish_status;
-    for (const auto& lease : leases) {
-        const auto block_start = lease.block_index * descriptor->coherence_block_bytes;
-        const auto block_bytes = std::min(descriptor->coherence_block_bytes, descriptor->bytes - block_start);
-        auto cached = std::make_shared<std::vector<std::byte>>(block_bytes);
-        std::memcpy(cached->data(), static_cast<std::byte*>(region_mapper_.base()) + write.lease.object.offset + block_start,
-                    block_bytes);
-        const auto key = descriptor->coherence_metadata_offset +
-                         lease.block_index * sizeof(CoherenceBlockDescriptor);
-        CacheReplica(key, write.lease.object.offset, lease.block_index, write.lease.allocation_id,
-                     lease.version + 1, cached);
     }
     write.reference_guard.reset();
     return Status::Ok();
 }
 
 Status LoomMemRuntime::AbortWriteBuffer(const WriteBuffer& write) {
-    if (!initialized_ || token_service_ == nullptr || write.storage == nullptr)
+    if (!initialized_ || token_service_ == nullptr || write.storage == nullptr || !write.reference_guard)
         return Status::FailedPrecondition("write buffer requires an initialized runtime and storage");
     const auto& leases = write.leases.empty() ? std::vector<TokenLease> {write.lease} : write.leases;
     Status result = Status::Ok();

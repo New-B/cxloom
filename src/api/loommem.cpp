@@ -25,20 +25,6 @@ struct WriteView::Impl {
     State state {State::kActive};
 };
 
-namespace {
-
-loommem::ReadConsistency ToInternal(ReadConsistency consistency) {
-    return consistency == ReadConsistency::kWholeRange ? loommem::ReadConsistency::kWholeRange
-                                                        : loommem::ReadConsistency::kPerBlock;
-}
-
-loommem::WriteAtomicity ToInternal(WriteAtomicity atomicity) {
-    return atomicity == WriteAtomicity::kWholeRange ? loommem::WriteAtomicity::kWholeRange
-                                                     : loommem::WriteAtomicity::kPerBlock;
-}
-
-}  // namespace
-
 Context::Context(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {}
 
 Context::~Context() = default;
@@ -131,7 +117,7 @@ Result<GPtr> clAlloc(Context& context, std::size_t bytes, std::size_t alignment)
 Result<GPtr> clAlloc(Context& context, const AllocOptions& options) {
     if (context.impl_ == nullptr || !context.impl_->active)
         return Status::FailedPrecondition("cl context is not active");
-    loommem::AllocationOptions internal {options.bytes, options.alignment, options.coherence_granularity,
+    loommem::AllocationOptions internal {options.bytes, options.alignment,
                                          options.coherence_block_bytes};
     return context.impl_->runtime.AllocateShared(internal);
 }
@@ -147,11 +133,10 @@ Result<ReadView> clRead(Context& context, GPtr object, std::uint64_t timeout_ms)
 }
 
 Result<ReadView> clReadRange(Context& context, GPtr object, std::uint64_t offset,
-                             std::uint64_t bytes, std::uint64_t timeout_ms, ReadConsistency consistency) {
+                             std::uint64_t bytes, std::uint64_t timeout_ms) {
     if (context.impl_ == nullptr || !context.impl_->active)
         return Status::FailedPrecondition("cl context is not active");
-    auto snapshot = context.impl_->runtime.AcquireReadRange(object, offset, bytes, timeout_ms,
-                                                             ToInternal(consistency));
+    auto snapshot = context.impl_->runtime.AcquireReadRange(object, offset, bytes, timeout_ms);
     if (!snapshot.ok())
         return snapshot.status();
     auto storage = std::shared_ptr<const void>(snapshot.value().storage, snapshot.value().data());
@@ -171,11 +156,10 @@ Result<WriteView> clWrite(Context& context, GPtr object, std::uint64_t timeout_m
 }
 
 Result<WriteView> clWriteRange(Context& context, GPtr object, std::uint64_t offset,
-                               std::uint64_t bytes, std::uint64_t timeout_ms, WriteAtomicity atomicity) {
+                               std::uint64_t bytes, std::uint64_t timeout_ms) {
     if (context.impl_ == nullptr || !context.impl_->active)
         return Status::FailedPrecondition("cl context is not active");
-    auto write = context.impl_->runtime.AcquireWriteRange(object, offset, bytes, timeout_ms,
-                                                           ToInternal(atomicity));
+    auto write = context.impl_->runtime.AcquireWriteRange(object, offset, bytes, timeout_ms);
     if (!write.ok())
         return write.status();
     auto impl = std::make_unique<WriteView::Impl>();

@@ -1,3 +1,4 @@
+#include "shared_region_fixture.h"
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -36,6 +37,7 @@ void Throw(void*) { throw std::runtime_error("test"); }
 int main() {
     CxloomConfig config;
     config.shared_region_bytes = 192ULL << 20;
+    SharedRegionFixture region(config);
     loommem::LoomMemRuntime mem(config);
     CHECK(mem.Initialize().ok());
     loompar::LoomParRuntime par(config, &mem);

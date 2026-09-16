@@ -12,13 +12,10 @@ namespace cxloom {
 
 using GPtr = GlobalPointer;
 
-enum class ReadConsistency { kPerBlock, kWholeRange };
-enum class WriteAtomicity { kPerBlock, kWholeRange };
-
 struct AllocOptions {
     std::size_t bytes {0};
     std::size_t alignment {0};
-    CoherenceGranularity coherence_granularity {CoherenceGranularity::kObject};
+    // Zero uses the runtime block size.
     std::size_t coherence_block_bytes {0};
 };
 
@@ -39,10 +36,10 @@ class Context {
     friend Result<GPtr> clAlloc(Context&, const AllocOptions&);
     friend Result<class ReadView> clRead(Context&, GPtr, std::uint64_t);
     friend Result<class ReadView> clReadRange(Context&, GPtr, std::uint64_t, std::uint64_t,
-                                               std::uint64_t, ReadConsistency);
+                                               std::uint64_t);
     friend Result<class WriteView> clWrite(Context&, GPtr, std::uint64_t);
     friend Result<class WriteView> clWriteRange(Context&, GPtr, std::uint64_t, std::uint64_t,
-                                                 std::uint64_t, WriteAtomicity);
+                                                 std::uint64_t);
     friend Status clFree(Context&, GPtr);
     friend class WriteView;
 };
@@ -62,7 +59,7 @@ class ReadView {
 
     friend Result<ReadView> clRead(Context&, GPtr, std::uint64_t);
     friend Result<ReadView> clReadRange(Context&, GPtr, std::uint64_t, std::uint64_t,
-                                         std::uint64_t, ReadConsistency);
+                                         std::uint64_t);
 };
 
 class WriteView {
@@ -87,7 +84,7 @@ class WriteView {
 
     friend Result<WriteView> clWrite(Context&, GPtr, std::uint64_t);
     friend Result<WriteView> clWriteRange(Context&, GPtr, std::uint64_t, std::uint64_t,
-                                           std::uint64_t, WriteAtomicity);
+                                           std::uint64_t);
 };
 
 Result<std::unique_ptr<Context>> clInit(CxloomConfig config);
@@ -96,16 +93,18 @@ Status clDestroy(std::unique_ptr<Context>& context);
 Result<GPtr> clAlloc(Context& context, std::size_t bytes, std::size_t alignment);
 Result<GPtr> clAlloc(Context& context, const AllocOptions& options);
 
+// Reads validate each block independently; multi-block results need not share a point in time.
 Result<ReadView> clRead(Context& context, GPtr object, std::uint64_t timeout_ms = 10000);
 Result<ReadView> clReadRange(Context& context, GPtr object, std::uint64_t offset,
-                             std::uint64_t bytes, std::uint64_t timeout_ms = 10000,
-                             ReadConsistency consistency = ReadConsistency::kPerBlock);
+                             std::uint64_t bytes, std::uint64_t timeout_ms = 10000);
 
+// Commits publish blocks independently, including for full-object writes.
 Result<WriteView> clWrite(Context& context, GPtr object, std::uint64_t timeout_ms = 10000);
 Result<WriteView> clWriteRange(Context& context, GPtr object, std::uint64_t offset,
-                               std::uint64_t bytes, std::uint64_t timeout_ms = 10000,
-                               WriteAtomicity atomicity = WriteAtomicity::kPerBlock);
+                               std::uint64_t bytes, std::uint64_t timeout_ms = 10000);
 
+// Timeout leaves the object RETIRING; retry to finish the same transaction.
+// All configured hosts must keep their progress pollers alive during reclamation.
 Status clFree(Context& context, GPtr object);
 
 }  // namespace cxloom

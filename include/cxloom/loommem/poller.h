@@ -35,7 +35,8 @@ using QueueMessageHandler = std::function<Status(QueueEnvelope)>;
 class QueuePoller {
 public:
   QueuePoller(HostId local_host, std::vector<SpscQueue *> inbound_queues,
-              QueueMessageHandler handler, QueuePollerOptions options = {});
+              QueueMessageHandler handler, QueuePollerOptions options = {},
+              std::function<Status()> progress = {});
   ~QueuePoller();
 
   QueuePoller(const QueuePoller &) = delete;
@@ -58,6 +59,7 @@ private:
   std::vector<SpscQueue *> inbound_queues_;
   QueueMessageHandler handler_;
   QueuePollerOptions options_{};
+  std::function<Status()> progress_;
   std::thread worker_;
   std::atomic<bool> running_{false};
   std::atomic<bool> start_gate_{false};

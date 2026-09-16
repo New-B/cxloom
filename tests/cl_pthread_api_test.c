@@ -1,3 +1,5 @@
+#include <stdlib.h>
+#include <unistd.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
@@ -17,8 +19,16 @@ int main(void) {
     config.replica_cache_capacity_entries = 1024;
     config.replica_cache_capacity_bytes = 64ULL << 20;
     config.bootstrap_timeout_ms = 10000;
+    char path[] = "/tmp/cxloom-c-api-XXXXXX";
+    const int fd = mkstemp(path);
+    if (fd < 0) return 1;
+    close(fd);
+    config.shared_region_path = path;
+    config.bootstrap_owner = 1;
+    config.create_region_file = 1;
     cl_runtime_t *runtime = NULL;
     cl_status_t status = cl_runtime_create(&config, &runtime);
+    unlink(path);
     if (status != CL_OK) { fprintf(stderr, "create=%d\n", status); return 1; }
     int value = 42;
     cl_pthread_t thread;

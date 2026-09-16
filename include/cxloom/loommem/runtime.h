@@ -9,7 +9,6 @@
 #include "cxloom/common/config.h"
 #include "cxloom/common/status.h"
 #include "cxloom/loommem/allocator.h"
-#include "cxloom/loommem/coherence.h"
 #include "cxloom/loommem/layout.h"
 #include "cxloom/loommem/poller.h"
 #include "cxloom/loommem/queue.h"
@@ -19,19 +18,15 @@
 
 namespace cxloom::loommem {
 
-enum class ReadConsistency { kPerBlock, kWholeRange };
-enum class WriteAtomicity { kPerBlock, kWholeRange };
-
 struct PublishedSharedObject {
     GlobalPointer gptr {};
     std::uint64_t bytes {0};
 };
 
+// Immutable per-block read results; no common point-in-time guarantee across blocks.
 struct ReadSnapshot {
     GlobalPointer object {};
     std::uint64_t offset {0};
-    std::uint64_t allocation_id {0};
-    Version version {0};
     std::vector<Version> block_versions;
     std::shared_ptr<const std::vector<std::byte>> storage;
 
@@ -45,7 +40,6 @@ struct WriteBuffer {
     std::uint64_t offset {0};
     std::shared_ptr<std::vector<std::byte>> storage;
     mutable std::shared_ptr<void> reference_guard;
-    WriteAtomicity atomicity {WriteAtomicity::kPerBlock};
 
     void* data() { return storage == nullptr ? nullptr : storage->data(); }
     const void* data() const { return storage == nullptr ? nullptr : storage->data(); }
@@ -54,7 +48,6 @@ struct WriteBuffer {
 
 struct ObjectReference {
     GlobalPointer object {};
-    std::uint64_t allocation_id {0};
     std::shared_ptr<void> guard;
 };
 
@@ -66,8 +59,7 @@ class LoomMemRuntime {
     Status Finalize();
 
     const SharedRegionLayout& layout() const { return layout_; }
-    GlobalAllocator& allocator() { return *allocator_; }
-    CoherenceManager& coherence() { return *coherence_; }
+    SharedExtentAllocator& allocator() { return *allocator_; }
 
     Result<GlobalPointer> AllocateShared(std::size_t bytes, std::size_t alignment);
     Result<GlobalPointer> AllocateShared(const AllocationOptions& options);
@@ -102,11 +94,9 @@ class LoomMemRuntime {
     Result<ReadSnapshot> AcquireReadSnapshot(GlobalPointer object, std::uint64_t timeout_ms);
     Result<WriteBuffer> AcquireWriteBuffer(GlobalPointer object, std::uint64_t timeout_ms);
     Result<ReadSnapshot> AcquireReadRange(GlobalPointer object, std::uint64_t offset,
-                                          std::uint64_t bytes, std::uint64_t timeout_ms,
-                                          ReadConsistency consistency = ReadConsistency::kPerBlock);
+                                          std::uint64_t bytes, std::uint64_t timeout_ms);
     Result<WriteBuffer> AcquireWriteRange(GlobalPointer object, std::uint64_t offset,
-                                          std::uint64_t bytes, std::uint64_t timeout_ms,
-                                          WriteAtomicity atomicity = WriteAtomicity::kPerBlock);
+                                          std::uint64_t bytes, std::uint64_t timeout_ms);
     Status ReleaseWriteBuffer(const WriteBuffer& write);
     Status AbortWriteBuffer(const WriteBuffer& write);
     // Transfers a buffer to the calling thread's next release boundary.
@@ -128,15 +118,13 @@ class LoomMemRuntime {
     BootstrapHeader* bootstrap_ {nullptr};
     AllocatorHeader* allocator_header_ {nullptr};
     CoherenceRegionHeader* coherence_header_ {nullptr};
-    std::unique_ptr<GlobalAllocator> allocator_;
-    std::unique_ptr<CoherenceManager> coherence_;
+    std::unique_ptr<SharedExtentAllocator> allocator_;
     std::vector<std::vector<std::unique_ptr<SpscQueue>>> queues_;
     std::unique_ptr<QueuePoller> queue_poller_;
     std::unique_ptr<TokenService> token_service_;
     struct CachedReplica {
         std::uint64_t object_offset {0};
         std::uint64_t block_index {0};
-        std::uint64_t allocation_id {0};
         Version version {0};
         std::shared_ptr<const std::vector<std::byte>> storage;
         std::uint64_t last_access {0};
@@ -149,13 +137,14 @@ class LoomMemRuntime {
     std::unordered_map<std::thread::id, std::vector<WriteBuffer>> staged_writes_;
     bool initialized_ {false};
 
+    Status ProgressRetirement();
+    std::mutex retirement_mutex_;
     Status InitializeBootstrap();
     Status AttachBootstrap();
     Status ValidateBootstrap(const BootstrapHeader& header) const;
     Status RegisterLocalHost();
     void CacheReplica(std::uint64_t cache_key, std::uint64_t object_offset, std::uint64_t block_index,
-                      std::uint64_t allocation_id, Version version,
-                      std::shared_ptr<const std::vector<std::byte>> storage);
+                      Version version, std::shared_ptr<const std::vector<std::byte>> storage);
     void EvictReplicasLocked();
 };
 

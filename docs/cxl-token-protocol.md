@@ -13,23 +13,23 @@ The current owner serializes accepted requests per block in local FIFO order.
 
 ReleaseWriteToken performs the handoff in this order:
 
-1. validate allocation ID, block identity, owner, epoch, and active lease;
+1. validate block identity, owner, epoch, and active lease;
 2. publish the mutated block using the configured visibility recipe;
 3. increment and publish the block version;
 4. increment the token epoch and publish the new owner;
 5. enqueue TOKEN_GRANT to the new owner.
 
-The receiver accepts a grant only when its allocation ID, block owner, version,
-and epoch match authoritative metadata. A delayed message for a freed object
-cannot affect a later allocation at the same GPtr because every allocation
-receives a new monotonic allocation ID.
+The receiver accepts a grant only when its block owner, version, and epoch
+match authoritative metadata. Messages for a retiring object are consumed
+without forwarding or granting; storage is not reusable until all queue
+watermarks and handlers have drained.
 
 ## Cross-queue ordering
 
 Round-robin polling deliberately does not impose arrival-time order across
 different producers. Correctness therefore does not depend on such an order.
 The current owner establishes the arbitration order when it drains requests
-and appends them to the per-object pending queue.
+and appends them to the per-block pending queue.
 
 There is also an explicit transfer window: metadata can name a new owner before
 that host drains TOKEN_GRANT. The new owner's local token state remains
@@ -40,7 +40,7 @@ order.
 
 The request handle remains active after a wait timeout, so callers may wait on
 the same handle again or cancel it. Owners explicitly answer an invalid,
-stale-allocation, or retiring request with TOKEN_REJECT. Cancellation uses
+invalid or retiring request with TOKEN_REJECT. Cancellation uses
 TOKEN_CANCEL and TOKEN_CANCEL_ACK; if a grant won the race, the requester
 immediately releases the late grant. Both synchronous cancellation and the
 fire-and-forget cancellation path reclaim terminal waiter state. Automatic
@@ -48,24 +48,23 @@ retry and host-failure recovery are not part of this protocol version.
 
 ## Retirement drain
 
-After the allocation owner changes an object from ALLOCATED to RETIRING, it
-sends TOKEN_RETIRE for every coherence block to that block's current token
-owner. The token owner atomically detaches its local pending queue, completes
-every detached request with TOKEN_REJECT(kRetiring), and then replies with
-TOKEN_RETIRE_ACK. Stale owners forward TOKEN_RETIRE according to authoritative
-sidecar ownership.
+When an owner changes an object from ALLOCATED to RETIRING, every host observes
+the shared retirement slot in its progress callback. New references and token
+requests fail. Each host closes local waiters and pending queues, discards
+unsent packets for the object, waits for admitted operations, records outbound
+producer watermarks, and acknowledges the closing phase. After every host has
+closed, each consumer advances through the recorded inbound watermarks. A
+final cleaning phase removes replicas and token state on every host. Only then
+may the owner invalidate the descriptor and return data and sidecar extents.
 
-FreeShared does not begin reference quiescence or release the descriptor and
-sidecar extents until every block acknowledgment arrives. Requests that race
-with the drain observe RETIRING in HandleRequest and are rejected directly.
-Consequently, deleting per-allocation token state cannot strand a normally
-queued requester.
+The retirement sequence is a control-transaction identifier, not an object
+generation. A timeout leaves the object RETIRING and the transaction resumable;
+there is no transition back to ALLOCATED.
 
 ## Runtime integration
 
 StartQueuePoller always installs an internal dispatcher for TOKEN_REQ,
-TOKEN_GRANT, TOKEN_REJECT, TOKEN_CANCEL, TOKEN_CANCEL_ACK, TOKEN_RETIRE, and
-TOKEN_RETIRE_ACK; an optional application handler receives all other message
+TOKEN_GRANT, TOKEN_REJECT, TOKEN_CANCEL, and TOKEN_CANCEL_ACK; an optional application handler receives all other message
 kinds.
 Token APIs require a shared runtime and a running poller.
 

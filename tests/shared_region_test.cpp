@@ -9,6 +9,16 @@
 #include "cxloom/loommem/runtime.h"
 
 int main() {
+    cxloom::CxloomConfig missing_path;
+    cxloom::loommem::LoomMemRuntime invalid_runtime(missing_path);
+    const auto invalid_status = invalid_runtime.Initialize();
+    cxloom::loommem::RegionMapper invalid_mapper;
+    const auto invalid_map_status = invalid_mapper.Map(missing_path);
+    if (invalid_status.code() != cxloom::StatusCode::kInvalidArgument ||
+        invalid_map_status.code() != cxloom::StatusCode::kInvalidArgument ||
+        invalid_mapper.base() != nullptr)
+        return 1;
+
     char path[] = "/tmp/cxloom-region-XXXXXX";
     const int fd = mkstemp(path);
     if (fd < 0)
@@ -143,7 +153,8 @@ int main() {
                                 received_by_owner.ok() && read_value(received_by_attacher.value()) == kOwnerValue &&
                                 read_value(received_by_owner.value()) == kAttacherValue;
 
-    const bool shared_free_succeeded = owner.FreeShared(owner_object.value()).ok();
+    const bool shared_free_succeeded = owner.StartQueuePoller().ok() && attacher.StartQueuePoller().ok() &&
+                                       owner.FreeShared(owner_object.value()).ok();
 
     attacher.Finalize();
     owner.Finalize();

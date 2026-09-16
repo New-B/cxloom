@@ -20,8 +20,6 @@ enum class MessageKind : std::uint16_t {
     kTokenReject,
     kTokenCancel,
     kTokenCancelAck,
-    kTokenRetire,
-    kTokenRetireAck,
     kLoadUpdate,
     kMigrateReq,
     kMigrateAck,
@@ -96,7 +94,6 @@ struct TokenRequest {
     MessageHeader header {};
     GlobalPointer object {};
     std::uint64_t block_index {0};
-    std::uint64_t allocation_id {0};
     std::uint64_t request_id {0};
     Version observed_version {0};
     HostId requester {0};
@@ -107,7 +104,6 @@ struct TokenGrant {
     MessageHeader header {};
     GlobalPointer object {};
     std::uint64_t block_index {0};
-    std::uint64_t allocation_id {0};
     std::uint64_t request_id {0};
     HostId new_owner {0};
     Version version {0};
@@ -117,7 +113,6 @@ struct TokenGrant {
 
 enum class TokenCompletionReason : std::uint16_t {
     kCancelled = 0,
-    kStaleAllocation,
     kRetiring,
     kInvalidBlock,
     kInvalidMetadata,
@@ -129,7 +124,6 @@ struct TokenReject {
     MessageHeader header {};
     GlobalPointer object {};
     std::uint64_t block_index {0};
-    std::uint64_t allocation_id {0};
     std::uint64_t request_id {0};
     HostId requester {0};
     TokenCompletionReason reason {TokenCompletionReason::kInternalFailure};
@@ -139,7 +133,6 @@ struct TokenCancel {
     MessageHeader header {};
     GlobalPointer object {};
     std::uint64_t block_index {0};
-    std::uint64_t allocation_id {0};
     std::uint64_t request_id {0};
     HostId requester {0};
 };
@@ -148,28 +141,9 @@ struct TokenCancelAck {
     MessageHeader header {};
     GlobalPointer object {};
     std::uint64_t block_index {0};
-    std::uint64_t allocation_id {0};
     std::uint64_t request_id {0};
     HostId requester {0};
     TokenCompletionReason reason {TokenCompletionReason::kCancelled};
-};
-
-struct TokenRetire {
-    MessageHeader header {};
-    GlobalPointer object {};
-    std::uint64_t block_index {0};
-    std::uint64_t allocation_id {0};
-    std::uint64_t retirement_id {0};
-    HostId coordinator {0};
-};
-
-struct TokenRetireAck {
-    MessageHeader header {};
-    GlobalPointer object {};
-    std::uint64_t block_index {0};
-    std::uint64_t allocation_id {0};
-    std::uint64_t retirement_id {0};
-    HostId coordinator {0};
 };
 
 }  // namespace cxloom

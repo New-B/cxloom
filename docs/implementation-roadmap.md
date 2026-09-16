@@ -132,7 +132,7 @@ Progress:
 - two-host integration coverage validates bidirectional handoff, publication, and stale-lease rejection
 - container and runtime initialization now derive queue topology and capacity from a 1..64 host count
 - variable-scale token and all-pairs queue tests validate non-fixed host counts
-- immutable host-local block replicas are cached by allocation ID and version
+- immutable host-local block replicas are cached by block address and version
 - readers refresh with an even/odd coherence epoch that rejects concurrent partial writeback
 - write buffers integrate token acquisition, data publication, version increment, and cache update
 - multi-runtime and variable-scale devdax tests cover single-writer/multi-reader refresh
@@ -150,55 +150,29 @@ while introducing configurable coherence blocks as token, version, writeback,
 and replica-cache units. See `coherence-block-design.md` for the normative
 design.
 
-Implementation order:
+Implemented design:
 
-1. split allocation metadata from dense block sidecar metadata while preserving
-   whole-object behavior
-2. add per-allocation block-size selection and single-block range APIs
-3. migrate the replica LRU and token messages to block identity
-4. support canonical-order multi-block acquisition and per-block commits
-5. add optional whole-range atomic publication
-6. retire objects after global reference quiescence and return their data and
-   sidecar extents to independent coalescing pools
+- fixed-size coherence blocks selected by runtime defaults or allocation options
+- a versioned coherence-region header and dense block sidecar allocator
+- allocation descriptors containing identity, lifecycle state, block dimensions,
+  sidecar location, extent information, and per-host activity counters
+- block sidecars published before allocation/bootstrap publication
+- token messages, leases, arbitration, versions, and writeback epochs using
+  `<object, block index>` identity
+- single- and multi-block range APIs, with full-object convenience wrappers
+  sharing the same per-block semantics
+- canonical-order token acquisition and rollback of partial acquisition
+- independent block publication and immutable range assembly from the bounded
+  block-replica LRU; cross-block invariants are the application's responsibility
+- object-wide retirement preventing new acquires, waiting for references and
+  writebacks to drain, and returning data and sidecar extents to separate pools
+- explicit token failure and cancellation through TOKEN_REJECT, TOKEN_CANCEL,
+  and TOKEN_CANCEL_ACK
+- shared retirement phases close all hosts, drain queue watermarks, clear local
+  state, and certify reclaimability before returning extents
 
-Progress:
-
-- added runtime-default and allocation-level object/fixed-block selection
-- added a versioned coherence-region header and dense block sidecar allocator
-- allocation descriptors record block size, count, sidecar offset, object
-  version, and the whole-range commit epoch
-- object mode initializes one sidecar block; fixed-block mode initializes the
-  calculated block array with bounds-checked lookup
-- block sidecars are published before allocation/bootstrap publication
-- token messages, leases, arbitration, versions, and writeback epochs use
-  `<object, allocation ID, block index>` identity
-- byte-range read/write APIs support single- and multi-block ranges while the
-  whole-object APIs remain compatibility wrappers
-- multi-block writers acquire tokens in ascending block order and roll back
-  partial acquisition on failure
-- the bounded replica LRU caches individual full blocks and assembles immutable
-  range snapshots
-- optional whole-range reads and writes use the allocation commit epoch as an
-  object-wide seqlock, while default range operations retain per-block
-  atomicity
-- per-host shared reference counters cover read-copy intervals, write-buffer
-  lifetimes, and explicit object references
-- object-wide retirement prevents new acquires, waits for references and
-  writebacks to drain, invalidates the descriptor, and independently returns
-  data and sidecar extents to split/coalesce free pools
-- each allocation creates a new descriptor and allocation ID; delayed token
-  messages carrying an older ID are rejected
-- token failures and cancellation complete explicitly through TOKEN_REJECT,
-  TOKEN_CANCEL, and TOKEN_CANCEL_ACK; cancelled waiter state is reclaimed
-- retirement drains every current block owner's pending queue, rejects those
-  requests with kRetiring, and waits for per-block TOKEN_RETIRE_ACK before
-  reclaiming descriptor or sidecar storage
-
-Compatibility requirement:
-
-- existing whole-object APIs remain wrappers over the full object range
-- every intermediate step keeps the current allocator, token, and coherence
-  tests passing
+The current bootstrap and allocator layout versions reject older shared regions;
+regions must be reinitialized before use with this layout.
 
 ## Phase 6: LoomPar Lifecycle Control
 

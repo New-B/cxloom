@@ -1,3 +1,4 @@
+#include "shared_region_fixture.h"
 #include <atomic>
 #include <chrono>
 #include <future>
@@ -42,6 +43,7 @@ int main() {
 
     // Finalize cannot remove transport while an application thread is in barrier.
     CxloomConfig config; config.shared_region_bytes = 192ULL << 20;
+    SharedRegionFixture region(config);
     loommem::LoomMemRuntime mem(config); CHECK(mem.Initialize().ok());
     loompar::LoomParRuntime par(config, &mem); CHECK(par.Initialize().ok());
     auto waiting = std::async(std::launch::async, [&] { return par.Barrier(7, 2); });

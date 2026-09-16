@@ -77,7 +77,7 @@ int main() {
     loompar::LoomParRuntime par(config, &mem);
     Require(par.Initialize());
     Require(par.RegisterFunction("sync-worker-v1", Worker).status());
-    loommem::AllocationOptions options{128, 64, CoherenceGranularity::kFixedBlock, 64};
+    loommem::AllocationOptions options{128, 64, 64};
     auto object = mem.AllocateShared(options);
     Require(object.status());
     Stage(object.value(), 0, 0);

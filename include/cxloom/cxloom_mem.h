@@ -29,17 +29,10 @@ typedef struct {
     uint64_t offset;
 } cl_gptr_t;
 
-typedef enum {
-    CL_COHERENCE_OBJECT = 0,
-    CL_COHERENCE_FIXED_BLOCK = 1,
-} cl_coherence_granularity_t;
-
 typedef struct {
     uint16_t local_host_id;
     uint16_t host_count;
     size_t shared_region_bytes;
-    // Legacy process-private placement hint; ignored by the shared allocator.
-    size_t per_host_extent_bytes;
     size_t coherence_granule_bytes;
     size_t queue_capacity_entries;
     const char *shared_region_path;
@@ -50,7 +43,6 @@ typedef struct {
     // Zero preserves the C++ runtime defaults.
     size_t replica_cache_capacity_entries;
     size_t replica_cache_capacity_bytes;
-    cl_coherence_granularity_t default_coherence_granularity;
 } cl_config_t;
 
 typedef enum {
@@ -75,12 +67,16 @@ void cl_runtime_destroy(cl_runtime_t *runtime);
 // are retired as whole objects. Their data and coherence-sidecar extents then
 // return to independent free pools; coherence blocks are never freed alone.
 cl_status_t cl_mem_alloc(cl_runtime_t *runtime, size_t bytes, size_t alignment, cl_gptr_t *out_gptr);
+// CL_UNAVAILABLE may leave the object retiring; retry until reclamation completes.
+// Every configured host must keep runtime progress alive during retirement.
 cl_status_t cl_mem_free(cl_runtime_t *runtime, cl_gptr_t gptr);
 
 // Resolves an offset-based global pointer into this host's mapping. This raw
 // address is for bootstrap/mapping tests only until coherence acquire/release
 // operations are added.
 cl_status_t cl_mem_resolve_local(cl_runtime_t *runtime, cl_gptr_t gptr, void **out_address);
+// Reads validate blocks independently; writes publish each block separately.
+// Cross-block invariants require application synchronization.
 cl_status_t cl_mem_read(cl_runtime_t *runtime, cl_gptr_t gptr, size_t offset,
                         void *out_bytes, size_t bytes, uint64_t timeout_ms);
 cl_status_t cl_mem_write(cl_runtime_t *runtime, cl_gptr_t gptr, size_t offset,

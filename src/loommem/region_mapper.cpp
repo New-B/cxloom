@@ -26,16 +26,10 @@ Status RegionMapper::Map(const CxloomConfig& config) {
         return Status::FailedPrecondition("shared region is already mapped");
     }
 
+    if (config.shared_region_path.empty())
+        return Status::InvalidArgument("shared_region_path must name a shared CXL device or test file");
     bytes_ = config.shared_region_bytes;
     path_ = config.shared_region_path;
-    if (path_.empty()) {
-        base_ = mmap(nullptr, bytes_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (base_ == MAP_FAILED) {
-            base_ = nullptr;
-            return SystemError("mmap anonymous region", "");
-        }
-        return Status::Ok();
-    }
 
     fd_ = open(path_.c_str(), O_RDWR | O_CLOEXEC);
     if (fd_ < 0) {
@@ -67,7 +61,6 @@ Status RegionMapper::Map(const CxloomConfig& config) {
         Unmap();
         return status;
     }
-    shared_ = true;
     return Status::Ok();
 }
 
@@ -86,7 +79,6 @@ Status RegionMapper::Unmap() {
         }
         fd_ = -1;
     }
-    shared_ = false;
     path_.clear();
     return status;
 }

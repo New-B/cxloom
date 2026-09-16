@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # Usage: ./scripts/run-smoke-containers.sh [container-count]
-# This validates build and NUMA placement only. The current runtime does not
-# yet map allocator metadata or queues into the shared CXL backing file.
+# Validates build and shared-memory behavior using a temporary shared file per container.
+# Real CXL validation is provided by run-host-init-containers.sh.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/host-count.sh"
 CONTAINER_COUNT="$(cxloom_resolve_host_count "${1:-}")"
@@ -20,6 +20,9 @@ for ((host_id = 0; host_id < CONTAINER_COUNT; ++host_id)); do
         cmake -S /workspace -B /tmp/cxloom-build -G Ninja
         cmake --build /tmp/cxloom-build --parallel
         ctest --test-dir /tmp/cxloom-build --output-on-failure
-        /tmp/cxloom-build/cxloom_smoke
+        smoke_region=$(mktemp /tmp/cxloom-smoke-XXXXXX)
+        cleanup_smoke() { rm -f "$smoke_region"; }
+        trap cleanup_smoke EXIT
+        CL_HOST_ID=0 CL_HOST_COUNT=1 /tmp/cxloom-build/cxloom_smoke "$smoke_region"
     '
 done

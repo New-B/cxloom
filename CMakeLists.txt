@@ -16,7 +16,6 @@ target_include_directories(cxloom_common PUBLIC include)
 
 add_library(cxloom_loommem STATIC
     src/loommem/allocator.cpp
-    src/loommem/coherence.cpp
     src/loommem/poller.cpp
     src/loommem/token.cpp
     src/loommem/queue.cpp
@@ -116,6 +115,11 @@ add_test(NAME cxloom_coherence_test COMMAND cxloom_coherence_test)
 add_executable(cxloom_block_range_test tests/block_range_test.cpp)
 target_link_libraries(cxloom_block_range_test PRIVATE cxloom_loommem)
 add_test(NAME cxloom_block_range_test COMMAND cxloom_block_range_test)
+
+add_executable(cxloom_retirement_test tests/retirement_test.cpp)
+target_link_libraries(cxloom_retirement_test PRIVATE cxloom_loommem)
+add_test(NAME cxloom_retirement_test COMMAND cxloom_retirement_test)
+set_tests_properties(cxloom_retirement_test PROPERTIES TIMEOUT 30)
 
 find_package(Threads REQUIRED)
 target_link_libraries(cxloom_loompar PUBLIC Threads::Threads)

@@ -1,3 +1,4 @@
+#include "shared_region_fixture.h"
 #include <atomic>
 #include <chrono>
 #include <future>
@@ -10,6 +11,7 @@ std::atomic<bool> release_thread{false};
 void Hold(void*) { while (!release_thread.load()) std::this_thread::yield(); }
 int main() {
   CxloomConfig config; config.shared_region_bytes = 192ULL << 20; config.max_running_threads_per_host = 1;
+  SharedRegionFixture region(config);
   loommem::LoomMemRuntime mem(config); CHECK(mem.Initialize().ok());
   loompar::LoomParRuntime par(config, &mem); CHECK(par.Initialize().ok());
   CHECK(par.RegisterFunction("hold", Hold).ok());
