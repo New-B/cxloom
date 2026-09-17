@@ -149,9 +149,19 @@ if they do not fit.
 The public C++ memory API is collected in `cxloom/loommem.h`. Applications use
 `clInit`/`clDestroy`, `clAlloc`, `clRead`/`clReadRange`,
 `clWrite`/`clWriteRange`, and `clFree`. `ReadView` owns an immutable snapshot;
-`WriteView` exposes `data()`, `Commit()`, and `Abort()`, and automatically
+`WriteView` exposes `data()`, `Commit()`, `Abort()`, and `Stage()`, and automatically
 aborts an active view on destruction. Runtime polling, token transfer,
 references, descriptors, and sidecars remain internal to this API.
+
+`WriteView::Stage()` transfers the buffer to the runtime without publishing it.
+On success the view is inactive (`data() == nullptr`, `size() == 0`); destroying
+or moving over it does not abort the staged write. The staging thread's next
+`clSynchronizeRelease(context)` publishes all its staged writes in order. Other
+threads' release calls and acquire boundaries do not publish them. Stop using
+all mutable pointers after staging, and release before the staging thread exits
+or the context is destroyed. Staged writes retain their tokens and delay object
+reclamation. A failed Stage leaves an active view's ownership unchanged.
+
 
 Objects are the allocation, addressing, and reclamation unit. Fixed-size
 coherence blocks within each object are independent token, version, writeback,

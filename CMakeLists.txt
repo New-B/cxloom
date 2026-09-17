@@ -181,3 +181,8 @@ add_executable(cxloom_read_access_test tests/read_access_test.cpp)
 target_link_libraries(cxloom_read_access_test PRIVATE cxloom_loommem)
 add_test(NAME cxloom_read_access_test COMMAND cxloom_read_access_test)
 set_tests_properties(cxloom_read_access_test PROPERTIES TIMEOUT 30)
+
+add_executable(cxloom_staged_write_api_test tests/staged_write_api_test.cpp)
+target_link_libraries(cxloom_staged_write_api_test PRIVATE cxloom)
+add_test(NAME cxloom_staged_write_api_test COMMAND cxloom_staged_write_api_test)
+set_tests_properties(cxloom_staged_write_api_test PROPERTIES TIMEOUT 30)

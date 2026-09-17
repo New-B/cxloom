@@ -148,8 +148,12 @@ and new-allocation resolution after address reuse without a generation check.
 
 ## Application API
 
-`clSynchronizeRelease(context)` publishes staged writes and executes release
-ordering. After the application observes its synchronization event,
+`WriteView::Stage()` transfers an edited buffer to the runtime and makes the
+view inactive. `clSynchronizeRelease(context)` publishes the calling native
+thread's staged writes in staging order and executes release ordering. Staging
+retains write tokens and operation pins until that release; other threads do
+not publish those buffers. Applications must stop using mutable pointers after
+staging and release before the staging thread exits or the context is destroyed. After the application observes its synchronization event,
 `clSynchronizeAcquire(context)` rotates the two indexes with acquire ordering.
 These calls do not themselves implement a cross-host rendezvous; LoomPar hooks
 invoke the runtime operations at its existing synchronization boundaries.

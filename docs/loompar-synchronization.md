@@ -74,6 +74,31 @@ auto child = par.CreateThread("registered-worker", args, placement);
 // The successful create publishes this creator's staged writes before dispatch.
 ```
 
+Applications using the public LoomMem API can transfer a `WriteView` with
+`Stage()` and publish at an explicit release boundary on the same context:
+
+```cpp
+auto write = cxloom::clWriteRange(context, object, offset, bytes);
+if (!write.ok()) return write.status();
+// Fill write.value().data(); finish all edits before transferring ownership.
+auto status = write.value().Stage();
+if (!status.ok()) return status;
+// The view is now inactive. More disjoint writes can be staged here.
+status = cxloom::clSynchronizeRelease(context);
+if (!status.ok()) return status;
+// Now publish the application's synchronization event to readers.
+```
+
+`Stage()` uses the same runtime staging mechanism as `StageWriteBuffer` below.
+It binds the write to the calling native thread, even if a different thread
+originally acquired the view. The ownership transfer between threads must be
+synchronized by the application. Successful staging disables `data`, `Commit`,
+`Abort`, and repeated `Stage` calls on that view; its destructor no longer aborts
+the buffer. On failure an active view remains owned by the application.
+`clDestroy` rejects a context containing staged writes and retains it for retry.
+The staging thread must release before exiting; another thread's release does
+not drain its pending writes. No acquire boundary publishes staged writes.
+
 StageWriteBuffer requires exclusive ownership of the buffer's storage and object
 reference. It empties the source buffer and stores it under the staging native
 thread's ID. Do not retain raw mutable aliases, make new aliases, mutate a staged

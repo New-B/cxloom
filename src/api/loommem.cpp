@@ -19,7 +19,7 @@ struct Context::Impl {
 };
 
 struct WriteView::Impl {
-    enum class State { kActive, kCommitted, kAborted };
+    enum class State { kActive, kCommitted, kAborted, kStaged };
     std::shared_ptr<Context::Impl> context;
     loommem::WriteBuffer buffer;
     State state {State::kActive};
@@ -78,6 +78,19 @@ Status WriteView::Abort() {
     const auto status = impl_->context->runtime.AbortWriteBuffer(impl_->buffer);
     if (status.ok()) {
         impl_->state = Impl::State::kAborted;
+        impl_->context.reset();
+    }
+    return status;
+}
+
+Status WriteView::Stage() {
+    if (impl_ == nullptr || impl_->state != Impl::State::kActive)
+        return Status::FailedPrecondition("write view is not active");
+    const auto status = impl_->context->runtime.StageWriteBuffer(&impl_->buffer);
+    if (status.ok()) {
+        impl_->state = Impl::State::kStaged;
+        // Runtime now owns the buffer and operation pin. Finalize rejects its
+        // pending staged writes; destroying this inactive view must not abort it.
         impl_->context.reset();
     }
     return status;

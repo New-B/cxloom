@@ -79,6 +79,11 @@ class WriteView {
     std::size_t size() const;
     Status Commit();
     Status Abort();
+    // Transfer ownership to the calling thread's next release boundary.
+    // On success this view becomes inactive; all previously obtained mutable
+    // pointers must stop being used. Failure leaves ownership unchanged.
+    // Staged writes keep their tokens until that same thread releases.
+    Status Stage();
 
   private:
     struct Impl;
@@ -92,6 +97,7 @@ class WriteView {
 
 Result<std::unique_ptr<Context>> clInit(CxloomConfig config);
 // On failure the context is retained; finish outstanding activity and retry.
+// Staged writes must be published by their staging threads before destruction.
 Status clDestroy(std::unique_ptr<Context>& context);
 
 Result<GPtr> clAlloc(Context& context, std::size_t bytes, std::size_t alignment);
@@ -106,7 +112,8 @@ Result<ReadView> clReadRange(Context& context, GPtr object, std::uint64_t offset
 // Drop this host's cached blocks without invalidating already returned views.
 Status clInvalidate(Context& context, GPtr object);
 // Pair these with application synchronization: release before publishing the
-// synchronization event, acquire after observing it. Acquire rotates caches.
+// synchronization event, acquire after observing it. Release commits only the
+// calling thread's staged writes, in staging order. Acquire rotates caches.
 Status clSynchronizeRelease(Context& context);
 Status clSynchronizeAcquire(Context& context);
 
