@@ -171,7 +171,14 @@ See `docs/cxl-coherence.md` for the protocol and
 management. `docs/object-retirement.md` specifies the all-host closing,
 watermark draining, cleaning, and reclaimable phases. The current shared layout
 requires reinitializing older regions
-(bootstrap version 11, allocator version 11).
+(bootstrap version 12, allocator version 12). The stable descriptor directory
+supports up to 2,048 live/retiring objects per region.
+
+Reads use release consistency: current-interval cache hits use local DRAM,
+while `clSynchronizeAcquire` rotates two replica indexes and validates old
+blocks lazily on their next access. `clInvalidate` explicitly drops local cached
+blocks. Replica references count hosts, independently of in-flight CXL operation
+pins. See [the read-access protocol](docs/read-access-design.md).
 
 Run the variable-scale devdax validation with:
 

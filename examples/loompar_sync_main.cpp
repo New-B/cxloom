@@ -106,7 +106,7 @@ int main() {
             Require(id.status());
             const auto joined = par.JoinThread(id.value());
             Check(joined.ok() == (test != 2), "unexpected join result");
-            Check(mem.cached_replica_count() == 0, "join failed to invalidate cached replicas");
+            // Join rotates replicas to old; the next read validates them lazily.
             auto fresh = mem.AcquireReadRange(object.value(), 0, 8, 10000);
             Require(fresh.status());
             Check(Value(fresh.value()) == 22 && Value(old.value()) == 7, "create/join publication or immutable snapshot failed");

@@ -1,5 +1,7 @@
 # Object and Coherence-Block Design
 
+> The implemented read path is specified in [Read Access under Release Consistency](read-access-design.md).
+
 ## 1. Decision
 
 LoomMem manages allocations in the global shared CXL region. Regular shared
@@ -67,14 +69,17 @@ struct AllocationDescriptor {
     uint64_t data_extent_offset;
     uint64_t data_extent_bytes;
     uint64_t coherence_extent_bytes;
-    atomic<uint64_t> active_references[kMaxHosts];
+    atomic<uint32_t> access_lock;
+    atomic<uint64_t> replica_hosts;
+    atomic<uint64_t> sealed_hosts;
+    atomic<uint64_t> active_operations[kMaxHosts];
 };
 ```
 
 Object addresses are valid only while the application-owned lifetime is active.
 LoomMem does not attach a generation or allocation identity to an object.
 Content versions and writeback epochs live only in block metadata. Object state
-and active references coordinate retirement and safe reclamation; they do not
+and independent replica-holder / active-operation counters coordinate retirement and safe reclamation; they do not
 provide data snapshot semantics.
 
 `coherence_metadata_offset` addresses a dense array in the reserved coherence
@@ -166,18 +171,17 @@ The cached entry stores its block version. The cache retains only the newest
 known replica for a block; immutable older versions survive only while held by
 application snapshots.
 
-For each required block, a reader:
+For each required block, a reader first looks in its host's current index and
+uses a hit without shared metadata access. `SynchronizeAcquire` discards the
+previous old index and rotates current to old. An old hit requires protected
+CXL admission and stable epoch/version validation before promotion; a changed
+or missing block is fetched using the same stable-copy protocol. A partial
+cache extension does not add another host reference. Only independently
+validated blocks enter current.
 
-1. acquires the block descriptor;
-2. retries if `writeback_epoch` is odd;
-3. records epoch and version;
-4. returns a matching local immutable replica, if present;
-5. otherwise copies the block from CXL;
-6. reacquires epoch and version;
-7. accepts the copy only if both are unchanged and the epoch is even.
-
-The existing entry-and-byte bounded LRU applies to individual block replicas.
-Eviction never invalidates snapshots already held by applications.
+Both indexes share the entry-and-byte bounded LRU. Eviction never invalidates
+snapshots already held by applications. The detailed locking, host membership,
+and boundary rules are in `read-access-design.md`.
 
 Blocks are validated independently in the normal mode. A multi-block read
 therefore provides a collection of individually consistent block versions.
@@ -266,12 +270,13 @@ Reclamation uses these states:
 ALLOCATED -> RETIRING -> FREE
 ```
 
-`RETIRING` rejects new reads, object references, and token requests. Existing
+`RETIRING` rejects new CXL admissions and token requests; valid current-index
+DRAM reads do not check object state. Existing
 writers retain their references and may finish publication. Reclamation waits until:
 
 - no block has an active write lease;
 - every writeback epoch is even;
-- every host's active-reference slot is zero;
+- every host's active-operation slot is zero and replica-holder membership is empty;
 - host-local cache entries for the retired object may only survive as detached
   immutable snapshots.
 
@@ -291,9 +296,9 @@ application lifetime error.
   acquisition, and assemble immutable results from independently stable blocks.
 - Full-object helpers use exactly the same range implementation and guarantees.
 - Object-wide reclamation retires the allocation, drains block requests and
-  active references, invalidates the descriptor, and returns data and sidecar
+  active operations, clears replica holders, invalidates the descriptor, and returns data and sidecar
   extents to separate split/coalesce pools.
-- Bootstrap layout version 11 and allocator layout version 10 identify the
+- Bootstrap layout version 12 and allocator layout version 12 identify the
   current descriptor layout. Existing shared regions must be reinitialized;
   attaching to an older layout is rejected.
 
@@ -312,7 +317,7 @@ including:
 - overlapping and disjoint multi-block ranges;
 - canonical-order acquisition without deadlock;
 - LRU eviction and reload at block granularity;
-- allocation-ID rejection after address reuse;
+- current-address resolution after reuse without allocation-ID validation;
 - devdax stress with configurable object and block sizes.
 
 ## 14. Non-Goals for the First Block Version

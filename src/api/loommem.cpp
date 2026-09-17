@@ -23,6 +23,12 @@ struct WriteView::Impl {
     std::shared_ptr<Context::Impl> context;
     loommem::WriteBuffer buffer;
     State state {State::kActive};
+    // The implementation is also destroyed when move assignment replaces an
+    // active view. Keep lease cleanup with the resource, not only its wrapper.
+    ~Impl() {
+        if (state == State::kActive && context != nullptr)
+            context->runtime.AbortWriteBuffer(buffer);
+    }
 };
 
 Context::Context(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -41,10 +47,7 @@ WriteView::WriteView(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 WriteView::WriteView(WriteView&&) noexcept = default;
 WriteView& WriteView::operator=(WriteView&&) noexcept = default;
 
-WriteView::~WriteView() {
-    if (impl_ != nullptr && impl_->state == Impl::State::kActive)
-        Abort();
-}
+WriteView::~WriteView() = default;
 
 void* WriteView::data() {
     return impl_ == nullptr || impl_->state != Impl::State::kActive ? nullptr : impl_->buffer.data();
@@ -101,11 +104,14 @@ Status clDestroy(std::unique_ptr<Context>& context) {
         return Status::FailedPrecondition("active write views must be committed or aborted before clDestroy");
     if (context->impl_ == nullptr || !context->impl_->active)
         return Status::FailedPrecondition("cl context is not active");
-    const auto poller = context->impl_->runtime.StopQueuePoller();
     const auto finalize = context->impl_->runtime.Finalize();
+    // Finalize checks outstanding retirement before stopping progress. Retain
+    // the context on failure so callers can finish the transaction and retry.
+    if (!finalize.ok())
+        return finalize;
     context->impl_->active = false;
     context.reset();
-    return !poller.ok() ? poller : finalize;
+    return Status::Ok();
 }
 
 Result<GPtr> clAlloc(Context& context, std::size_t bytes, std::size_t alignment) {
@@ -141,6 +147,24 @@ Result<ReadView> clReadRange(Context& context, GPtr object, std::uint64_t offset
         return snapshot.status();
     auto storage = std::shared_ptr<const void>(snapshot.value().storage, snapshot.value().data());
     return ReadView(std::move(storage), snapshot.value().data(), snapshot.value().bytes());
+}
+
+Status clInvalidate(Context& context, GPtr object) {
+    if (context.impl_ == nullptr || !context.impl_->active)
+        return Status::FailedPrecondition("cl context is not active");
+    return context.impl_->runtime.InvalidateReadCache(object);
+}
+
+Status clSynchronizeRelease(Context& context) {
+    if (context.impl_ == nullptr || !context.impl_->active)
+        return Status::FailedPrecondition("cl context is not active");
+    return context.impl_->runtime.SynchronizeRelease();
+}
+
+Status clSynchronizeAcquire(Context& context) {
+    if (context.impl_ == nullptr || !context.impl_->active)
+        return Status::FailedPrecondition("cl context is not active");
+    return context.impl_->runtime.SynchronizeAcquire();
 }
 
 Result<WriteView> clWrite(Context& context, GPtr object, std::uint64_t timeout_ms) {

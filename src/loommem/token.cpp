@@ -721,7 +721,7 @@ bool TokenService::CloseObject(GlobalPointer object) {
             if (target == object) it = pending.erase(it); else ++it;
         }
     }
-    return !held && descriptor.value()->active_references[local_host_].load(std::memory_order_acquire) == 0;
+    return !held && descriptor.value()->active_operations[local_host_].load(std::memory_order_acquire) == 0;
 }
 
 void TokenService::ForgetAllocation(GlobalPointer, std::uint64_t coherence_metadata_offset,

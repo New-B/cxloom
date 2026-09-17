@@ -84,6 +84,11 @@ add_executable(cxloom_loommem_user_api_test tests/loommem_user_api_test.cpp)
 target_link_libraries(cxloom_loommem_user_api_test PRIVATE cxloom)
 add_test(NAME cxloom_loommem_user_api_test COMMAND cxloom_loommem_user_api_test)
 
+add_executable(cxloom_loommem_lifecycle_test tests/loommem_lifecycle_test.cpp)
+target_link_libraries(cxloom_loommem_lifecycle_test PRIVATE cxloom)
+add_test(NAME cxloom_loommem_lifecycle_test COMMAND cxloom_loommem_lifecycle_test)
+set_tests_properties(cxloom_loommem_lifecycle_test PROPERTIES TIMEOUT 30)
+
 add_executable(cxloom_shared_region_test tests/shared_region_test.cpp)
 target_link_libraries(cxloom_shared_region_test PRIVATE cxloom_loommem)
 add_test(NAME cxloom_shared_region_test COMMAND cxloom_shared_region_test)
@@ -171,3 +176,8 @@ add_test(NAME cxloom_migration_protocol_test COMMAND cxloom_migration_protocol_t
 
 add_executable(cxloom_loompar_scheduler_bench examples/loompar_scheduler_bench.cpp)
 target_link_libraries(cxloom_loompar_scheduler_bench PRIVATE cxloom_loompar)
+
+add_executable(cxloom_read_access_test tests/read_access_test.cpp)
+target_link_libraries(cxloom_read_access_test PRIVATE cxloom_loommem)
+add_test(NAME cxloom_read_access_test COMMAND cxloom_read_access_test)
+set_tests_properties(cxloom_read_access_test PROPERTIES TIMEOUT 30)

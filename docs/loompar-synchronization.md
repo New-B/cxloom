@@ -92,9 +92,12 @@ is not a multi-object atomic transaction. LoomPar worker completion attempts thi
 release even if the function throws, reports failure through join, and runs the
 join acquire hook. A failed worker-start acquire skips the function.
 
-SynchronizeAcquire executes the acquire fence and clears the host's reusable
-replica cache under its mutex. A subsequent AcquireReadRange/AcquireReadSnapshot
-validates versions and obtains a fresh snapshot. Snapshots already returned to
+SynchronizeAcquire executes the acquire fence and rotates the host's two
+replica indexes: the previous old index is cleared, current becomes old, and
+current starts empty. Subsequent reads validate only requested old blocks,
+promoting unchanged replicas or fetching changed/missing blocks from CXL.
+Current hits use local DRAM without shared metadata access. Both indexes share
+one host membership per object and the same bounded LRU capacity. Snapshots already returned to
 applications remain immutable and keep their old values; reacquire after a
 synchronization boundary to see subsequent writes. No hook makes arbitrary direct
 mapped writes, private pointers or data races valid shared-memory accesses.

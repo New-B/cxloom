@@ -3,6 +3,7 @@
 #include <thread>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -103,6 +104,7 @@ class LoomMemRuntime {
     Status StageWriteBuffer(WriteBuffer* write);
     Status SynchronizeRelease();
     Status SynchronizeAcquire();
+    Status InvalidateReadCache(GlobalPointer object);
     std::size_t staged_write_count() const;
     const QueuePoller* queue_poller() const { return queue_poller_.get(); }
     std::size_t queue_capacity_entries() const { return config_.queue_capacity_entries; }
@@ -130,7 +132,20 @@ class LoomMemRuntime {
         std::uint64_t last_access {0};
     };
     mutable std::mutex replicas_mutex_;
-    std::unordered_map<std::uint64_t, CachedReplica> replicas_;
+    using ReplicaIndex = std::unordered_map<std::uint64_t, CachedReplica>;
+    ReplicaIndex replicas_; // current synchronization interval
+    ReplicaIndex old_replicas_;
+    struct CachedObject {
+        AllocationInfo info;
+        AllocationDescriptor* descriptor;
+        std::size_t blocks;
+    };
+    std::unordered_map<std::uint64_t, CachedObject> cached_objects_;
+    // Reads of different objects run concurrently. Boundaries wait for admitted
+    // local reads/fills, preventing pre-boundary installation into current.
+    mutable std::shared_mutex replica_boundary_mutex_;
+    std::mutex object_mutexes_mutex_;
+    std::unordered_map<std::uint64_t, std::weak_ptr<std::mutex>> object_mutexes_;
     std::size_t cached_replica_bytes_ {0};
     std::uint64_t replica_access_clock_ {0};
     mutable std::mutex staged_mutex_;
@@ -143,8 +158,14 @@ class LoomMemRuntime {
     Status AttachBootstrap();
     Status ValidateBootstrap(const BootstrapHeader& header) const;
     Status RegisterLocalHost();
-    void CacheReplica(std::uint64_t cache_key, std::uint64_t object_offset, std::uint64_t block_index,
-                      Version version, std::shared_ptr<const std::vector<std::byte>> storage);
+    std::shared_ptr<std::mutex> LocalObjectMutex(std::uint64_t object_offset);
+    Result<ReadSnapshot> ReadRange(GlobalPointer object, std::uint64_t offset,
+                                   std::uint64_t bytes, std::uint64_t timeout_ms, bool full_object);
+    void CacheReplicaLocked(std::uint64_t cache_key, const AllocationInfo& info,
+                            AllocationDescriptor* descriptor, std::uint64_t block_index,
+                            Version version, std::shared_ptr<const std::vector<std::byte>> storage);
+    void EraseReplicaLocked(ReplicaIndex& index, ReplicaIndex::iterator entry);
+    void InvalidateObjectLocked(std::uint64_t object_offset);
     void EvictReplicasLocked();
 };
 

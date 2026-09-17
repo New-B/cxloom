@@ -69,6 +69,21 @@ int main() {
         }
     }
 
+    // Public boundary and explicit invalidation APIs preserve detached views.
+    auto update = cxloom::clWriteRange(*host1.value(), object.value(), 0, 64, 2000);
+    if (update.ok()) std::fill_n(static_cast<std::byte*>(update.value().data()), 64, std::byte{0x33});
+    passed = passed && update.ok() && update.value().Commit().ok() &&
+             cxloom::clSynchronizeRelease(*host1.value()).ok();
+    const auto before = cxloom::clReadRange(*host0.value(), object.value(), 0, 1, 2000);
+    passed = passed && before.ok() && *static_cast<const std::byte*>(before.value().data()) == std::byte{0x11};
+    passed = passed && cxloom::clSynchronizeAcquire(*host0.value()).ok();
+    const auto after = cxloom::clReadRange(*host0.value(), object.value(), 0, 1, 2000);
+    passed = passed && after.ok() && *static_cast<const std::byte*>(after.value().data()) == std::byte{0x33};
+    passed = passed && cxloom::clInvalidate(*host0.value(), object.value()).ok();
+    const auto reloaded = cxloom::clReadRange(*host0.value(), object.value(), 0, 1, 2000);
+    passed = passed && reloaded.ok() && *static_cast<const std::byte*>(reloaded.value().data()) == std::byte{0x33} &&
+             *static_cast<const std::byte*>(read.value().data()) == std::byte{0x11};
+
     passed = passed && object.ok() && cxloom::clFree(*host0.value(), object.value()).ok();
     const auto destroy1 = cxloom::clDestroy(host1.value());
     const auto destroy0 = cxloom::clDestroy(host0.value());

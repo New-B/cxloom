@@ -22,10 +22,10 @@ class GlobalAllocator {
 
 inline constexpr std::uint64_t kAllocatorMagic = 0x43584c4f4f4d414cULL;
 inline constexpr std::uint64_t kAllocationMagic = 0x43584c4f4f4d4f42ULL;
-inline constexpr std::uint32_t kAllocatorLayoutVersion = 11;
+inline constexpr std::uint32_t kAllocatorLayoutVersion = 12;
 inline constexpr std::uint32_t kInvalidExtentIndex = UINT32_MAX;
 // Bounded shared metadata keeps the allocator header within the 256 KiB
-// bootstrap mapping while still allowing thousands of extents.
+// allocator mapping while still allowing thousands of extents.
 inline constexpr std::size_t kMaxSharedExtentNodes = 4096;
 inline constexpr std::size_t kTlsfBinCount = 64;
 
@@ -94,7 +94,15 @@ struct alignas(64) AllocationDescriptor {
     std::uint64_t data_extent_offset {0};
     std::uint64_t data_extent_bytes {0};
     std::uint64_t coherence_extent_bytes {0};
-    std::array<std::atomic<std::uint64_t>, kMaxHosts> active_references {};
+    std::atomic<std::uint32_t> access_lock {0};
+    // Replica references count hosts; operations independently pin CXL storage.
+    std::atomic<std::uint64_t> replica_hosts {0};
+    std::atomic<std::uint64_t> sealed_hosts {0};
+    std::array<std::atomic<std::uint64_t>, kMaxHosts> active_operations {};
+
+    std::size_t replica_reference_count() const {
+        return static_cast<std::size_t>(__builtin_popcountll(replica_hosts.load(std::memory_order_acquire)));
+    }
 };
 
 enum class SharedExtentState : std::uint32_t { kUnused = 0, kFree = 1 };
@@ -133,6 +141,14 @@ struct RetirementControl {
     std::array<std::array<std::uint64_t, kMaxHosts>, kMaxHosts> watermarks {};
 };
 
+// Region-lifetime discovery slots protect descriptor construction/destruction.
+// Readers of different slots never contend; descriptor locks handle admission.
+inline constexpr std::size_t kMaxAllocationSlots = 2048;
+struct AllocationSlot {
+    std::atomic<std::uint64_t> object_offset {0};
+    std::atomic<std::uint32_t> readers {0}; // UINT32_MAX means exclusive reuse.
+};
+
 struct alignas(64) AllocatorHeader {
     std::uint64_t magic {0};
     std::uint32_t layout_version {0};
@@ -153,7 +169,10 @@ struct alignas(64) AllocatorHeader {
     std::uint32_t reserved1 {0};
     std::array<SharedExtentNode, kMaxSharedExtentNodes> extent_nodes {};
     RetirementControl retirement {};
+    std::array<AllocationSlot, kMaxAllocationSlots> allocations {};
 };
+
+static_assert(sizeof(AllocatorHeader) <= (256ULL << 10), "allocator header exceeds its minimum region");
 
 Status FormatSharedAllocator(AllocatorHeader* header, std::size_t allocator_region_bytes,
                              std::uint64_t shared_data_offset, std::uint64_t shared_data_bytes,
@@ -175,6 +194,7 @@ class SharedExtentAllocator final : public GlobalAllocator {
     // Internal lookup; callers must hold a reference or own the retirement phase
     // while dereferencing the result. Describe returns a locked metadata copy.
     Result<AllocationDescriptor*> MutableDescriptor(GlobalPointer gptr, bool allow_retiring = false) const;
+    // Operation pins are independent of replica_reference_count().
     Result<AllocationDescriptor*> AcquireReference(GlobalPointer gptr, HostId host, bool allow_retiring = false) const;
     Status ReleaseReference(AllocationDescriptor* descriptor, HostId host) const;
     Result<RetirementSnapshot> BeginRetire(GlobalPointer object, std::uint16_t host_count);
@@ -199,6 +219,7 @@ class SharedExtentAllocator final : public GlobalAllocator {
     bool initialized_ {false};
 
     Result<AllocationDescriptor*> FindDescriptorLocked(GlobalPointer object, bool allow_retiring) const;
+    Result<AllocationSlot*> LockAllocationSlot(GlobalPointer object) const;
     void LockExtents() const;
     void UnlockExtents() const;
     Result<std::uint32_t> ReserveExtentNodeLocked() const;

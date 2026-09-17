@@ -94,6 +94,10 @@ int main() {
     const auto transaction = owner.allocator().Retirement();
     CHECK(transaction.phase == RetirementPhase::kClosing);
     CHECK(!owner.DescribeSharedAllocation(object).ok());
+    // A valid DRAM hit remains usable during Closing; explicit invalidation
+    // forces CXL admission, which must reject the retiring object.
+    CHECK(reader.AcquireReadSnapshot(object, 10).ok());
+    CHECK(reader.InvalidateReadCache(object).ok());
     CHECK(!reader.AcquireReadSnapshot(object, 10).ok());
     CHECK(!writer.AcquireWriteBuffer(object, 10).ok());
     CHECK(!reader.RequestWriteToken(object).ok());

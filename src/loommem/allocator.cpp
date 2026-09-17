@@ -4,10 +4,29 @@
 #include <cstring>
 #include <limits>
 #include <new>
+#include <thread>
 
 namespace cxloom::loommem {
 
 namespace {
+
+class ObjectLock {
+  public:
+    explicit ObjectLock(AllocationDescriptor* descriptor) : lock_(descriptor->access_lock) {
+        std::uint32_t expected = 0;
+        while (!lock_.compare_exchange_weak(expected, 1, std::memory_order_acquire)) {
+            expected = 0;
+            std::this_thread::yield();
+        }
+    }
+    ~ObjectLock() { lock_.store(0, std::memory_order_release); }
+  private:
+    std::atomic<std::uint32_t>& lock_;
+};
+struct SlotGuard {
+    AllocationSlot* slot;
+    ~SlotGuard() { slot->readers.fetch_sub(1, std::memory_order_release); }
+};
 
 std::uint64_t AlignUp(std::uint64_t value, std::size_t alignment) {
     const auto safe_alignment = std::max<std::size_t>(alignment, 1);
@@ -109,8 +128,8 @@ Status SharedExtentAllocator::Initialize() {
     if (static_cast<AllocatorState>(header_->state.load(std::memory_order_acquire)) != AllocatorState::kReady) {
         return Status::FailedPrecondition("shared allocator is not ready");
     }
-    if (!header_->state.is_lock_free() ||
-        !header_->extent_lock.is_lock_free()) {
+    if (!header_->state.is_lock_free() || !header_->extent_lock.is_lock_free() ||
+        !header_->allocations[0].object_offset.is_lock_free() || !header_->allocations[0].readers.is_lock_free()) {
         return Status::FailedPrecondition("shared allocator requires lock-free shared atomics");
     }
     if (header_->shared_data_offset != expected_data_offset_ || header_->shared_data_bytes != expected_data_bytes_ ||
@@ -161,9 +180,21 @@ Result<GlobalPointer> SharedExtentAllocator::Allocate(const AllocationOptions& o
     const auto data_extent_bytes = sizeof(AllocationDescriptor) + bytes + alignment - 1;
     const auto coherence_extent_bytes = block_count * sizeof(CoherenceBlockDescriptor);
     LockExtents();
+    AllocationSlot* slot = nullptr;
+    for (auto& candidate : header_->allocations) {
+        if (candidate.object_offset.load(std::memory_order_relaxed) == 0) {
+            std::uint32_t expected = 0;
+            if (candidate.readers.compare_exchange_strong(expected, UINT32_MAX, std::memory_order_acquire)) {
+                slot = &candidate;
+                break;
+            }
+        }
+    }
+    if (!slot) { UnlockExtents(); return Status::Unavailable("allocation discovery slots exhausted"); }
     const auto data_extent = AllocateExtentLocked(&header_->data_free_head, data_extent_bytes,
                                                    alignof(AllocationDescriptor));
     if (!data_extent.ok()) {
+        slot->readers.store(0, std::memory_order_release);
         UnlockExtents();
         return data_extent.status();
     }
@@ -171,10 +202,11 @@ Result<GlobalPointer> SharedExtentAllocator::Allocate(const AllocationOptions& o
                                                         alignof(CoherenceBlockDescriptor));
     if (!coherence_extent.ok()) {
         FreeExtentLocked(&header_->data_free_head, data_extent.value(), data_extent_bytes);
+        slot->readers.store(0, std::memory_order_release);
         UnlockExtents();
         return coherence_extent.status();
     }
-    UnlockExtents();
+    // Publish discovery only after the entire descriptor is initialized.
 
     const auto object_offset = AlignUp(data_extent.value() + sizeof(AllocationDescriptor), alignment);
     auto* descriptor = reinterpret_cast<AllocationDescriptor*>(region_base_ + object_offset -
@@ -200,6 +232,9 @@ Result<GlobalPointer> SharedExtentAllocator::Allocate(const AllocationOptions& o
         blocks[index].writeback_epoch.store(0, std::memory_order_relaxed);
     }
     descriptor->state.store(static_cast<std::uint32_t>(AllocationState::kAllocated), std::memory_order_release);
+    slot->object_offset.store(object_offset, std::memory_order_release);
+    slot->readers.store(0, std::memory_order_release);
+    UnlockExtents();
     return GlobalPointer {0, object_offset};
 }
 
@@ -220,22 +255,43 @@ Result<AllocationDescriptor*> SharedExtentAllocator::FindDescriptorLocked(Global
     return descriptor;
 }
 
+Result<AllocationSlot*> SharedExtentAllocator::LockAllocationSlot(GlobalPointer object) const {
+    if (!initialized_) return Status::FailedPrecondition("shared allocator is not initialized");
+    if (object.region_id != 0 || object.offset == 0)
+        return Status::InvalidArgument("invalid allocation address");
+    for (auto& slot : header_->allocations) {
+        if (slot.object_offset.load(std::memory_order_acquire) != object.offset) continue;
+        auto readers = slot.readers.load(std::memory_order_relaxed);
+        while (readers != UINT32_MAX && readers != UINT32_MAX - 1) {
+            if (slot.readers.compare_exchange_weak(readers, readers + 1, std::memory_order_acquire)) {
+                if (slot.object_offset.load(std::memory_order_acquire) == object.offset) return &slot;
+                slot.readers.fetch_sub(1, std::memory_order_release);
+                break;
+            }
+        }
+    }
+    return Status::NotFound("address has no accessible allocation slot");
+}
+
 Result<AllocationInfo> SharedExtentAllocator::Describe(GlobalPointer object) const {
-    LockExtents();
+    const auto slot = LockAllocationSlot(object);
+    if (!slot.ok()) return slot.status();
+    SlotGuard guard {slot.value()};
     const auto found = FindDescriptorLocked(object, false);
-    if (!found.ok()) { UnlockExtents(); return found.status(); }
+    if (!found.ok()) return found.status();
+    ObjectLock lock(found.value());
+    if (found.value()->state.load(std::memory_order_acquire) != static_cast<std::uint32_t>(AllocationState::kAllocated))
+        return Status::NotFound("object is retiring");
     const auto* d = found.value();
-    AllocationInfo info {object, d->bytes, d->alignment, d->owner_host,
-                         d->coherence_block_bytes, d->coherence_block_count, d->coherence_metadata_offset};
-    UnlockExtents();
-    return info;
+    return AllocationInfo {object, d->bytes, d->alignment, d->owner_host,
+                           d->coherence_block_bytes, d->coherence_block_count, d->coherence_metadata_offset};
 }
 
 Result<AllocationDescriptor*> SharedExtentAllocator::MutableDescriptor(GlobalPointer object, bool allow_retiring) const {
-    LockExtents();
-    const auto result = FindDescriptorLocked(object, allow_retiring);
-    UnlockExtents();
-    return result;
+    const auto slot = LockAllocationSlot(object);
+    if (!slot.ok()) return slot.status();
+    SlotGuard guard {slot.value()};
+    return FindDescriptorLocked(object, allow_retiring);
 }
 
 Result<HostId> SharedExtentAllocator::OwningHost(GlobalPointer object) const {
@@ -246,24 +302,27 @@ Result<HostId> SharedExtentAllocator::OwningHost(GlobalPointer object) const {
 Result<AllocationDescriptor*> SharedExtentAllocator::AcquireReference(GlobalPointer object, HostId host,
                                                                       bool allow_retiring) const {
     if (host >= kMaxHosts) return Status::InvalidArgument("reference host is out of range");
-    // Admission begins before looking up reclaimable storage. BeginRetire and
-    // Free use this same stable, region-lifetime lock.
-    LockExtents();
+    const auto slot = LockAllocationSlot(object);
+    if (!slot.ok()) return slot.status();
+    SlotGuard guard {slot.value()};
     const auto found = FindDescriptorLocked(object, allow_retiring);
-    if (found.ok() && allow_retiring && header_->retirement.current.phase != RetirementPhase::kIdle &&
-        header_->retirement.current.object == object && (header_->retirement.closed & (1ULL << host))) {
-        UnlockExtents(); return Status::FailedPrecondition("host has sealed this retiring object");
-    }
-    if (found.ok()) found.value()->active_references[host].fetch_add(1, std::memory_order_relaxed);
-    UnlockExtents();
+    if (!found.ok()) return found.status();
+    ObjectLock lock(found.value());
+    const auto state = static_cast<AllocationState>(found.value()->state.load(std::memory_order_acquire));
+    if (state != AllocationState::kAllocated &&
+        !(allow_retiring && state == AllocationState::kRetiring))
+        return Status::FailedPrecondition("object is retiring");
+    if (found.value()->sealed_hosts.load(std::memory_order_relaxed) & (1ULL << host))
+        return Status::FailedPrecondition("host has sealed this retiring object");
+    found.value()->active_operations[host].fetch_add(1, std::memory_order_relaxed);
     return found;
 }
 
 Status SharedExtentAllocator::ReleaseReference(AllocationDescriptor* descriptor, HostId host) const {
     if (!descriptor || host >= kMaxHosts) return Status::InvalidArgument("invalid reference release");
-    const auto previous = descriptor->active_references[host].fetch_sub(1, std::memory_order_acq_rel);
+    const auto previous = descriptor->active_operations[host].fetch_sub(1, std::memory_order_acq_rel);
     if (previous == 0) {
-        descriptor->active_references[host].fetch_add(1, std::memory_order_relaxed);
+        descriptor->active_operations[host].fetch_add(1, std::memory_order_relaxed);
         return Status::FailedPrecondition("object reference count underflow");
     }
     return Status::Ok();
@@ -290,7 +349,10 @@ Result<RetirementSnapshot> SharedExtentAllocator::BeginRetire(GlobalPointer obje
     }
     r.current = {RetirementPhase::kClosing, object, r.current.sequence + 1, local_host_, host_count};
     r.closed = r.drained = r.cleaned = 0;
-    found.value()->state.store(static_cast<std::uint32_t>(AllocationState::kRetiring), std::memory_order_release);
+    {
+        ObjectLock lock(found.value());
+        found.value()->state.store(static_cast<std::uint32_t>(AllocationState::kRetiring), std::memory_order_release);
+    }
     const auto snapshot = r.current;
     UnlockExtents();
     return snapshot;
@@ -304,8 +366,12 @@ RetirementSnapshot SharedExtentAllocator::Retirement() const {
 }
 
 bool SharedExtentAllocator::IsRetiring(GlobalPointer object) const {
-    const auto r = Retirement();
-    return r.phase != RetirementPhase::kIdle && r.object == object;
+    const auto slot = LockAllocationSlot(object);
+    if (!slot.ok()) return false;
+    SlotGuard guard {slot.value()};
+    const auto descriptor = FindDescriptorLocked(object, true);
+    return descriptor.ok() && descriptor.value()->state.load(std::memory_order_acquire) ==
+                                 static_cast<std::uint32_t>(AllocationState::kRetiring);
 }
 
 bool SharedExtentAllocator::RetirementAcknowledged(const RetirementSnapshot& t, HostId host) const {
@@ -328,6 +394,13 @@ Status SharedExtentAllocator::AcknowledgeRetirement(const RetirementSnapshot& t,
     const auto bit = 1ULL << host;
     const auto all = t.host_count == 64 ? UINT64_MAX : (1ULL << t.host_count) - 1;
     if (t.phase == RetirementPhase::kClosing) {
+        const auto descriptor = FindDescriptorLocked(t.object, true);
+        if (!descriptor.ok()) { UnlockExtents(); return descriptor.status(); }
+        ObjectLock lock(descriptor.value());
+        if (descriptor.value()->active_operations[host].load(std::memory_order_acquire) != 0) {
+            UnlockExtents(); return Status::Unavailable("host still has active CXL operations");
+        }
+        descriptor.value()->sealed_hosts.fetch_or(bit, std::memory_order_release);
         r.watermarks[host] = cursors;
         r.closed |= bit;
         if (r.closed == all) r.current.phase = RetirementPhase::kDraining;
@@ -491,12 +564,25 @@ Status SharedExtentAllocator::Free(GlobalPointer gptr) {
         transaction.coordinator != local_host_) {
         UnlockExtents(); return Status::FailedPrecondition("storage reclamation requires all-host retirement completion");
     }
+    AllocationSlot* slot = nullptr;
+    for (auto& candidate : header_->allocations)
+        if (candidate.object_offset.load(std::memory_order_acquire) == gptr.offset) { slot = &candidate; break; }
+    if (!slot) { UnlockExtents(); return Status::NotFound("allocation slot not found"); }
+    std::uint32_t expected = 0;
+    if (!slot->readers.compare_exchange_strong(expected, UINT32_MAX, std::memory_order_acquire)) {
+        UnlockExtents(); return Status::Unavailable("descriptor discovery is still active");
+    }
     const auto found = FindDescriptorLocked(gptr, true);
-    if (!found.ok()) { UnlockExtents(); return found.status(); }
+    if (!found.ok()) { slot->readers.store(0, std::memory_order_release); UnlockExtents(); return found.status(); }
     auto* descriptor = found.value();
-    for (const auto& active : descriptor->active_references) {
+    if (descriptor->replica_hosts.load(std::memory_order_acquire) != 0) {
+        slot->readers.store(0, std::memory_order_release);
+        UnlockExtents(); return Status::Unavailable("allocation still has replica holders");
+    }
+    for (const auto& active : descriptor->active_operations) {
         if (active.load(std::memory_order_acquire) != 0) {
-            UnlockExtents(); return Status::Unavailable("allocation still has active references");
+            slot->readers.store(0, std::memory_order_release);
+            UnlockExtents(); return Status::Unavailable("allocation still has active operations");
         }
     }
     const auto data_offset = descriptor->data_extent_offset;
@@ -508,6 +594,7 @@ Status SharedExtentAllocator::Free(GlobalPointer gptr) {
         available_nodes += header_->extent_nodes[index].state ==
                            static_cast<std::uint32_t>(SharedExtentState::kUnused);
     if (available_nodes < 2) {
+        slot->readers.store(0, std::memory_order_release);
         UnlockExtents();
         return Status::Unavailable("insufficient extent metadata to reclaim object atomically");
     }
@@ -519,8 +606,10 @@ Status SharedExtentAllocator::Free(GlobalPointer gptr) {
     if (data_status.ok() && coherence_status.ok()) {
         descriptor->state.store(static_cast<std::uint32_t>(AllocationState::kEmpty), std::memory_order_release);
         descriptor->magic = 0;
+        slot->object_offset.store(0, std::memory_order_release);
         header_->retirement.current.phase = RetirementPhase::kIdle;
     }
+    slot->readers.store(0, std::memory_order_release);
     UnlockExtents();
     return !data_status.ok() ? data_status : coherence_status;
 }

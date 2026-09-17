@@ -119,6 +119,7 @@ int main() {
     passed = passed && concurrent_reader.ok() && concurrent_reader.value().block_versions.at(0) == 1 &&
              Valid(concurrent_reader.value(), 1, 0);
     passed = passed && host1.ReleaseWriteBuffer(second_write.value()).ok();
+    passed = passed && host2.SynchronizeAcquire().ok();
     const auto refreshed = host2.AcquireReadSnapshot(object.value(), 2000);
     passed = passed && refreshed.ok() && refreshed.value().block_versions.at(0) == 2 && Valid(refreshed.value(), 2, 1) &&
              Valid(first_read2.value(), 1, 0);
@@ -153,6 +154,7 @@ int main() {
     // LRU eviction drops only the runtime's cache reference. A snapshot held
     // by the application remains valid, while reacquiring the evicted object
     // transparently refreshes it from CXL.
+    passed = passed && host2.SynchronizeAcquire().ok();
     const auto retained_snapshot = host2.AcquireReadSnapshot(object.value(), 2000);
     const auto second_object = host0.AllocateShared(sizeof(Record), alignof(Record));
     auto other_write = second_object.ok() ? host0.AcquireWriteBuffer(second_object.value(), 2000)

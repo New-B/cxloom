@@ -1,5 +1,7 @@
 # Object Retirement and Safe Space Reuse
 
+> The implemented read path is specified in [Read Access under Release Consistency](read-access-design.md).
+
 LoomMem uses object-level lifetime management and block-level data coherence.
 An object has an address, extent information, and lifecycle state. It has no
 per-allocation identity or generation. Block versions and token epochs remain
@@ -25,24 +27,25 @@ coalescing several old extents. A new allocation need not have the same shape.
 
 ## Stable admission and metadata lifetime
 
-The allocator header exists for the entire shared-region session. Its shared
-lock protects descriptor lookup and reference registration, the ALLOCATED to
-RETIRING transition, and the final return of extents to the free pools. A read
-or write must register before dereferencing reclaimable metadata. Checking a
-state bit and only later registering a reference is insufficient.
+The allocator header exists for the entire shared-region session. Its global
+lock protects allocation, retirement control, and final extent return. Existing
+object accesses use stable allocation lookup slots followed by the object's
+descriptor lock; they never take the allocator lock. A slot pin prevents
+reclamation while looking up or waiting for the descriptor lock. Metadata-only
+queries copy under this protection; raw descriptor results require an active
+operation or ownership of the retirement phase before dereferencing.
 
-Metadata-only queries return a copy made while holding this lock. Internal raw
-descriptor lookups require an existing reference or ownership of a retirement
-phase. Raw address resolution is diagnostic only; it does not pin storage for
-arbitrary application loads and stores.
+Replica references count hosts holding cached blocks across both indexes. They
+do not count read calls. Separately, `active_operations[host]` protects admitted
+CXL copies, token metadata operations, and write-buffer lifetimes. Current-index
+hits read immutable DRAM without admission or lifecycle checks. Old-index hits
+and misses require admission and are rejected once the object is RETIRING.
 
-References cover read assembly and cache installation, write-buffer lifetimes,
-and short token metadata operations. Active raw token leases additionally keep
-local token state held. An admitted read may finish during retirement. A writer
-may commit or abort; retirement never steals a buffer that an application may
-still be modifying. Staged writes remain pinned until their originating thread
-runs SynchronizeRelease. A per-block release during retirement cannot grant the
-token to another waiter.
+An admitted CXL read may finish during retirement. Writers may commit or abort;
+staged writes remain pinned until their originating thread runs
+SynchronizeRelease. A per-block release during retirement cannot grant the
+token to another waiter. Closing acknowledgement seals the host under the
+object lock after checking its active operations are zero.
 
 ## Shared retirement control
 
@@ -71,8 +74,8 @@ to the shared control transaction, not to object data consistency.
 
 ### Closing
 
-The coordinator changes ALLOCATED to RETIRING under the admission lock. All new
-normal references and token requests fail. Each host's progress callback then:
+The coordinator changes ALLOCATED to RETIRING under the object lock. New CXL
+admissions and token requests fail; valid current-index DRAM hits may continue. Each host's progress callback then:
 
 - serializes with local token producers and message handlers;
 - wakes and removes the object's pending waiters;
@@ -117,7 +120,8 @@ not matter. Other objects' traffic may continue beyond the fixed watermarks.
 ### Cleaning
 
 After all hosts acknowledge draining, each host removes the object's block
-replicas from its cache directory and its per-block token/arbitration state.
+replicas from both indexes, clears its replica-holder bit, and removes its
+per-block token/arbitration state.
 No admitted reader or writer can reinstall a replica at this point. The final
 acknowledgement is published only after cleanup completes.
 
@@ -128,9 +132,11 @@ freeing of those private copies follows their normal shared ownership lifetime.
 
 ### Reclaimable
 
-After all cleaning acknowledgements, the coordinator verifies that references
-are zero, invalidates the descriptor, and returns both data and sidecar extents
-under the allocator lock. The slot becomes idle before releasing the lock.
+After all cleaning acknowledgements, the coordinator exclusively closes the
+stable allocation slot and verifies zero active operations and replica holders.
+It then invalidates the descriptor and returns both data and sidecar extents
+under the allocator lock. A lookup still pinning the slot postpones reclamation;
+the coordinator retries until its deadline. The slot becomes idle before releasing the lock.
 Allocation cannot observe either returned extent before descriptor invalidation
 and transaction completion. Calling the allocator's reclaim primitive without
 the matching completed transaction fails.
@@ -160,11 +166,12 @@ storage early.
 This initial protocol deliberately trades reclamation throughput for a simple
 completion proof: one concurrent retirement, O(H^2) watermark storage in the
 region header, and O(H) progress work per participant. The existing shared
-allocator lock also protects admission. Neither is a claim of scalable
-allocation or reclamation; allocator sharding and batched retirement are
+allocator lock is limited to allocation and retirement control. Ordinary
+admission uses object locks and stable discovery slots; allocator sharding and
+batched retirement are
 separate future optimizations that must preserve the invariant above.
 
-Bootstrap layout 11 and allocator layout 10 reject older shared regions. All
+Bootstrap layout 12 and allocator layout 12 reject older shared regions. All
 hosts must use the same rebuilt protocol and reinitialize their shared region.
 
 The retirement test covers all-host cache eviction, a paused message callback,

@@ -1,7 +1,10 @@
 # LoomMem Single-Writer/Multi-Reader Coherence
 
+> The implemented read path is specified in [Read Access under Release Consistency](read-access-design.md).
+
 Each shared allocation has an ephemeral allocation descriptor, CXL-resident
-per-block authoritative metadata, shared per-host activity counters, and
+per-block authoritative metadata, a per-object admission lock, shared
+replica-host membership, independent per-host active-operation counters, and
 host-private immutable block replicas.
 
 ## Public operations
@@ -11,7 +14,8 @@ host-private immutable block replicas.
 - ReleaseWriteBuffer publishes each affected block separately, increments that
   block's version, ends its writeback epoch, and releases its token.
 - AcquireReadRange returns immutable storage plus an ordered block-version
-  vector. Each block reuses a matching cached replica or refreshes it from CXL.
+  vector. Current-index hits read DRAM directly; old-index hits are validated
+  against CXL on demand after an acquire boundary, and misses fill from CXL.
 - AcquireReadSnapshot and AcquireWriteBuffer are convenience wrappers covering
   the complete allocation. They use the same per-block guarantees.
 
@@ -25,9 +29,10 @@ LRU replacement. Eviction removes only the runtime's cache reference; snapshots
 already held by applications remain valid through shared ownership. A block
 larger than the byte budget can still be returned as a snapshot but is evicted
 immediately instead of remaining resident. Write buffers are caller-owned and
-are never cache eviction candidates while they hold a write token. The
-immutable replica installed after a successful release is subject to the same
-LRU limits as reader-created replicas.
+are never cache eviction candidates while they hold a write token. Local
+publication invalidates the affected cached blocks in both indexes;
+subsequent reads fill the newly committed version. Both indexes share the same
+LRU capacity and one host membership per cached object.
 
 ## Stable-copy protocol
 
@@ -39,9 +44,9 @@ version, then restores an even epoch.
 Consequently, readers can continue to acquire the last committed version while
 a writer holds and modifies its private buffer.
 
-A reader:
+A reader accessing CXL (a current-index hit skips this entire protocol):
 
-1. acquires an object reference in its host's shared activity slot;
+1. registers an active operation through a stable lookup slot and object lock;
 2. waits while the block writeback epoch is odd;
 3. records the block epoch and block version;
 4. copies the shared block bytes;
@@ -56,9 +61,11 @@ on different hosts to consume immutable snapshots concurrently.
 
 The protocol operates at configurable block granularity. A new read may
 return the last committed version while a buffered writer holds the token, and
-only waits or retries during the writer's actual CXL writeback window. An
-already acquired immutable snapshot may be used until its owner explicitly
-acquires another snapshot. A timed-out
+a cache miss waits or retries during the writer's actual CXL writeback window.
+Within one synchronization interval a cached block may continue to return an
+older committed version. `SynchronizeAcquire` rotates current/old indexes;
+the next access validates old blocks and refreshes changed ones. Already
+returned immutable snapshots remain valid independently of cache lifetime. A timed-out
 synchronous write acquisition abandons its request; a late grant is released
 without changing the block version. Cross-block invariants require application
 synchronization. Host failure recovery remains future work.

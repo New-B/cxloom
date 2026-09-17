@@ -166,7 +166,8 @@ Status LoomMemRuntime::Finalize() {
     token_service_.reset();
     {
         std::lock_guard<std::mutex> lock(replicas_mutex_);
-        replicas_.clear();
+        while (!replicas_.empty()) EraseReplicaLocked(replicas_, replicas_.begin());
+        while (!old_replicas_.empty()) EraseReplicaLocked(old_replicas_, old_replicas_.begin());
         cached_replica_bytes_ = 0;
         replica_access_clock_ = 0;
     }
@@ -226,8 +227,10 @@ Status LoomMemRuntime::FreeShared(GlobalPointer gptr) {
             if (!status.ok()) return status;
         }
         const auto transaction = allocator_->Retirement();
-        if (transaction.phase == RetirementPhase::kReclaimable)
-            return allocator_->Free(gptr);
+        if (transaction.phase == RetirementPhase::kReclaimable) {
+            const auto status = allocator_->Free(gptr);
+            if (status.code() != StatusCode::kUnavailable) return status;
+        }
         if (queue_poller_ && !queue_poller_->running())
             return Status::Unavailable("retirement retained after poller failure");
         std::this_thread::yield();
@@ -262,12 +265,7 @@ Status LoomMemRuntime::ProgressRetirement() {
         token_service_->ForgetAllocation(transaction.object, descriptor.value()->coherence_metadata_offset,
                                          descriptor.value()->coherence_block_count);
         std::lock_guard<std::mutex> lock(replicas_mutex_);
-        for (auto it = replicas_.begin(); it != replicas_.end();) {
-            if (it->second.object_offset == transaction.object.offset) {
-                cached_replica_bytes_ -= it->second.storage->size();
-                it = replicas_.erase(it);
-            } else ++it;
-        }
+        InvalidateObjectLocked(transaction.object.offset);
     }
     const auto status = allocator_->AcknowledgeRetirement(transaction, config_.local_host_id, cursors);
     return status.code() == StatusCode::kUnavailable ? Status::Ok() : status;
@@ -534,6 +532,10 @@ Result<SpscQueue*> LoomMemRuntime::GetQueue(HostId producer, HostId consumer) {
 Status LoomMemRuntime::StartQueuePoller(QueueMessageHandler handler, QueuePollerOptions options) {
     if (!initialized_)
         return Status::FailedPrecondition("runtime must be initialized before starting the queue poller");
+    // Local token arbitration is synchronous, and single-host retirement is
+    // driven by FreeShared. There are no transport channels to poll.
+    if (config_.host_count == 1)
+        return Status::Ok();
     if (queue_poller_ != nullptr)
         return Status::AlreadyExists("runtime already owns a queue poller");
 
@@ -572,7 +574,7 @@ Status LoomMemRuntime::StopQueuePoller() {
 Result<TokenRequestHandle> LoomMemRuntime::RequestWriteToken(GlobalPointer object, std::uint64_t block_index) {
     if (!initialized_ || token_service_ == nullptr)
         return Status::FailedPrecondition("write tokens require an initialized shared runtime");
-    if (queue_poller_ == nullptr || !queue_poller_->running())
+    if (config_.host_count > 1 && (queue_poller_ == nullptr || !queue_poller_->running()))
         return Status::FailedPrecondition("write tokens require a running queue poller");
     return token_service_->Request(object, block_index);
 }
@@ -587,7 +589,25 @@ Result<TokenLease> LoomMemRuntime::WaitForWriteToken(const TokenRequestHandle& r
 Status LoomMemRuntime::ReleaseWriteToken(const TokenLease& lease) {
     if (!initialized_ || token_service_ == nullptr)
         return Status::FailedPrecondition("write tokens require an initialized shared runtime");
-    return token_service_->Release(lease);
+    std::shared_lock<std::shared_mutex> boundary(replica_boundary_mutex_);
+    auto mutex = LocalObjectMutex(lease.object.offset);
+    // Finish an odd raw-write epoch before waiting for a same-object reader:
+    // that reader may itself be waiting for this writeback to become stable.
+    const auto status = token_service_->Release(lease);
+    std::lock_guard<std::mutex> object_lock(*mutex);
+    if (status.ok()) {
+        std::lock_guard<std::mutex> lock(replicas_mutex_);
+        const auto object = cached_objects_.find(lease.object.offset);
+        if (object != cached_objects_.end()) {
+            const auto key = object->second.info.coherence_metadata_offset +
+                             lease.block_index * sizeof(CoherenceBlockDescriptor);
+            for (auto* index : {&replicas_, &old_replicas_}) {
+                const auto entry = index->find(key);
+                if (entry != index->end()) EraseReplicaLocked(*index, entry);
+            }
+        }
+    }
+    return status;
 }
 
 Status LoomMemRuntime::CancelWriteTokenRequest(const TokenRequestHandle& request) {
@@ -605,7 +625,7 @@ Status LoomMemRuntime::CancelWriteTokenRequestAndWait(const TokenRequestHandle& 
 
 std::size_t LoomMemRuntime::cached_replica_count() const {
     std::lock_guard<std::mutex> lock(replicas_mutex_);
-    return replicas_.size();
+    return replicas_.size() + old_replicas_.size();
 }
 
 std::size_t LoomMemRuntime::cached_replica_bytes() const {
@@ -617,123 +637,207 @@ std::size_t LoomMemRuntime::pending_token_request_count() const {
     return token_service_ == nullptr ? 0 : token_service_->pending_request_count();
 }
 
-void LoomMemRuntime::EvictReplicasLocked() {
-    while (replicas_.size() > config_.replica_cache_capacity_entries ||
-           cached_replica_bytes_ > config_.replica_cache_capacity_bytes) {
-        auto victim = replicas_.end();
-        for (auto candidate = replicas_.begin(); candidate != replicas_.end(); ++candidate) {
-            if (victim == replicas_.end() || candidate->second.last_access < victim->second.last_access)
-                victim = candidate;
-        }
-        if (victim == replicas_.end())
-            break;
-        cached_replica_bytes_ -= victim->second.storage->size();
-        replicas_.erase(victim);
+std::shared_ptr<std::mutex> LoomMemRuntime::LocalObjectMutex(std::uint64_t offset) {
+    std::lock_guard<std::mutex> lock(object_mutexes_mutex_);
+    // Weak entries never own an object or CXL storage; bound dead discovery keys.
+    if (object_mutexes_.size() > 1024) {
+        for (auto it = object_mutexes_.begin(); it != object_mutexes_.end();)
+            if (it->second.expired()) it = object_mutexes_.erase(it); else ++it;
+    }
+    auto& weak = object_mutexes_[offset];
+    auto mutex = weak.lock();
+    if (!mutex) { mutex = std::make_shared<std::mutex>(); weak = mutex; }
+    return mutex;
+}
+
+void LoomMemRuntime::EraseReplicaLocked(ReplicaIndex& index, ReplicaIndex::iterator entry) {
+    auto object = cached_objects_.find(entry->second.object_offset);
+    cached_replica_bytes_ -= entry->second.storage->size();
+    index.erase(entry);
+    if (--object->second.blocks == 0) {
+        // Membership itself pins the descriptor until retirement cleaning.
+        object->second.descriptor->replica_hosts.fetch_and(~(1ULL << config_.local_host_id),
+                                                          std::memory_order_acq_rel);
+        cached_objects_.erase(object);
     }
 }
 
-void LoomMemRuntime::CacheReplica(std::uint64_t cache_key, std::uint64_t object_offset,
-                                  std::uint64_t block_index, Version version,
-                                  std::shared_ptr<const std::vector<std::byte>> storage) {
+void LoomMemRuntime::InvalidateObjectLocked(std::uint64_t offset) {
+    for (auto* index : {&replicas_, &old_replicas_}) {
+        for (auto it = index->begin(); it != index->end();) {
+            if (it->second.object_offset == offset) {
+                auto victim = it++;
+                EraseReplicaLocked(*index, victim);
+            } else ++it;
+        }
+    }
+}
+
+Status LoomMemRuntime::InvalidateReadCache(GlobalPointer object) {
+    if (!initialized_) return Status::FailedPrecondition("invalidation requires initialized LoomMem");
+    if (object.region_id != 0) return Status::InvalidArgument("invalid region id");
+    std::shared_lock<std::shared_mutex> boundary(replica_boundary_mutex_);
+    auto mutex = LocalObjectMutex(object.offset);
+    std::lock_guard<std::mutex> object_lock(*mutex);
     std::lock_guard<std::mutex> lock(replicas_mutex_);
-    const auto existing = replicas_.find(cache_key);
-    if (existing != replicas_.end()) {
-        cached_replica_bytes_ -= existing->second.storage->size();
-        replicas_.erase(existing);
+    InvalidateObjectLocked(object.offset);
+    return Status::Ok();
+}
+
+void LoomMemRuntime::EvictReplicasLocked() {
+    while (replicas_.size() + old_replicas_.size() > config_.replica_cache_capacity_entries ||
+           cached_replica_bytes_ > config_.replica_cache_capacity_bytes) {
+        ReplicaIndex* victim_index = nullptr;
+        ReplicaIndex::iterator victim;
+        for (auto* index : {&replicas_, &old_replicas_}) {
+            for (auto candidate = index->begin(); candidate != index->end(); ++candidate) {
+                if (!victim_index || candidate->second.last_access < victim->second.last_access) {
+                    victim_index = index;
+                    victim = candidate;
+                }
+            }
+        }
+        if (!victim_index) break;
+        EraseReplicaLocked(*victim_index, victim);
+    }
+}
+
+void LoomMemRuntime::CacheReplicaLocked(std::uint64_t cache_key, const AllocationInfo& info,
+                                         AllocationDescriptor* descriptor, std::uint64_t block_index,
+                                         Version version, std::shared_ptr<const std::vector<std::byte>> storage) {
+    auto object = cached_objects_.find(info.gptr.offset);
+    if (object == cached_objects_.end()) {
+        object = cached_objects_.emplace(info.gptr.offset, CachedObject {info, descriptor, 0}).first;
+        descriptor->replica_hosts.fetch_or(1ULL << config_.local_host_id, std::memory_order_acq_rel);
+    }
+    // Account for the replacement before erasing old/current entries so a host
+    // retaining a replica never drops and re-adds its shared membership.
+    ++object->second.blocks;
+    for (auto* index : {&replicas_, &old_replicas_}) {
+        const auto existing = index->find(cache_key);
+        if (existing != index->end()) EraseReplicaLocked(*index, existing);
     }
     cached_replica_bytes_ += storage->size();
-    replicas_.emplace(cache_key, CachedReplica {object_offset, block_index, version,
+    replicas_.emplace(cache_key, CachedReplica {info.gptr.offset, block_index, version,
                                                 std::move(storage), ++replica_access_clock_});
     EvictReplicasLocked();
 }
 
 Result<ReadSnapshot> LoomMemRuntime::AcquireReadSnapshot(GlobalPointer object, std::uint64_t timeout_ms) {
-    const auto reference = AcquireObjectReference(object);
-    if (!reference.ok()) return reference.status();
-    const auto allocation = DescribeSharedAllocation(object);
-    if (!allocation.ok())
-        return allocation.status();
-    return AcquireReadRange(object, 0, allocation.value().bytes, timeout_ms);
+    return ReadRange(object, 0, 0, timeout_ms, true);
 }
 
 Result<ReadSnapshot> LoomMemRuntime::AcquireReadRange(GlobalPointer object, std::uint64_t offset,
-                                                       std::uint64_t bytes, std::uint64_t timeout_ms) {
+                                                      std::uint64_t bytes, std::uint64_t timeout_ms) {
+    return ReadRange(object, offset, bytes, timeout_ms, false);
+}
+
+Result<ReadSnapshot> LoomMemRuntime::ReadRange(GlobalPointer object, std::uint64_t offset,
+                                               std::uint64_t bytes, std::uint64_t timeout_ms, bool full_object) {
     if (!initialized_ || timeout_ms == 0)
         return Status::FailedPrecondition("read ranges require an initialized shared runtime and timeout");
+    if (object.region_id != 0) return Status::InvalidArgument("invalid region id");
+    std::shared_lock<std::shared_mutex> boundary(replica_boundary_mutex_);
+    auto mutex = LocalObjectMutex(object.offset);
+    std::lock_guard<std::mutex> object_lock(*mutex);
     auto* allocator = allocator_.get();
-    const auto descriptor_result = allocator->AcquireReference(object, config_.local_host_id);
-    if (!descriptor_result.ok())
-        return descriptor_result.status();
-    auto* descriptor = descriptor_result.value();
-    std::shared_ptr<void> reference_guard(
-        descriptor, [allocator, host = config_.local_host_id](void* p) {
+    AllocationInfo info {};
+    AllocationDescriptor* descriptor = nullptr;
+    std::shared_ptr<void> operation_guard;
+    auto admit = [&]() -> Status {
+        if (operation_guard) return Status::Ok();
+        const auto result = allocator->AcquireReference(object, config_.local_host_id);
+        if (!result.ok()) return result.status();
+        descriptor = result.value();
+        operation_guard = std::shared_ptr<void>(descriptor, [allocator, host = config_.local_host_id](void* p) {
             allocator->ReleaseReference(static_cast<AllocationDescriptor*>(p), host);
         });
-    if (bytes == 0 || offset > descriptor->bytes || bytes > descriptor->bytes - offset)
+        if (info.bytes != 0 && (info.bytes != descriptor->bytes ||
+            info.coherence_block_bytes != descriptor->coherence_block_bytes ||
+            info.coherence_metadata_offset != descriptor->coherence_metadata_offset))
+            return Status::Unavailable("allocation changed during local cache lookup; retry the read");
+        info = AllocationInfo {object, descriptor->bytes, descriptor->alignment, descriptor->owner_host,
+                               descriptor->coherence_block_bytes, descriptor->coherence_block_count,
+                               descriptor->coherence_metadata_offset};
+        return Status::Ok();
+    };
+    {
+        std::lock_guard<std::mutex> lock(replicas_mutex_);
+        const auto cached = cached_objects_.find(object.offset);
+        if (cached != cached_objects_.end()) info = cached->second.info;
+    }
+    if (info.bytes == 0) {
+        const auto status = admit();
+        if (!status.ok()) return status;
+    }
+    if (full_object) bytes = info.bytes;
+    if (bytes == 0 || offset > info.bytes || bytes > info.bytes - offset)
         return Status::InvalidArgument("read range is empty or outside the allocation");
-    const auto first_block = offset / descriptor->coherence_block_bytes;
-    const auto last_block = (offset + bytes - 1) / descriptor->coherence_block_bytes;
+    const auto first_block = offset / info.coherence_block_bytes;
+    const auto last_block = (offset + bytes - 1) / info.coherence_block_bytes;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     auto assembled = std::make_shared<std::vector<std::byte>>(bytes);
     std::shared_ptr<const std::vector<std::byte>> single_block_replica;
     std::vector<Version> versions;
     versions.reserve(last_block - first_block + 1);
     for (std::uint64_t index = first_block; index <= last_block; ++index) {
-        const auto block_result = allocator->MutableCoherenceBlock(object, index, true);
-        if (!block_result.ok())
-            return block_result.status();
-        auto* block = block_result.value();
-        const auto block_start = index * descriptor->coherence_block_bytes;
-        const auto block_bytes = std::min(descriptor->coherence_block_bytes, descriptor->bytes - block_start);
-        const auto cache_key = descriptor->coherence_metadata_offset + index * sizeof(CoherenceBlockDescriptor);
+        const auto block_start = index * info.coherence_block_bytes;
+        const auto block_bytes = std::min(info.coherence_block_bytes, info.bytes - block_start);
+        const auto cache_key = info.coherence_metadata_offset + index * sizeof(CoherenceBlockDescriptor);
         std::shared_ptr<const std::vector<std::byte>> replica;
         Version accepted_version = 0;
-        while (std::chrono::steady_clock::now() < deadline) {
-            const auto metadata_status = AcquireData(block, sizeof(*block), VisibilityMode::kReleaseAcquire);
-            if (!metadata_status.ok())
-                return metadata_status;
-            const auto epoch_before = block->writeback_epoch.load(std::memory_order_acquire);
-            if ((epoch_before & 1U) != 0) {
-                std::this_thread::yield();
-                continue;
+        {
+            std::lock_guard<std::mutex> lock(replicas_mutex_);
+            const auto cached = replicas_.find(cache_key);
+            if (cached != replicas_.end() && cached->second.object_offset == object.offset) {
+                replica = cached->second.storage;
+                accepted_version = cached->second.version;
+                cached->second.last_access = ++replica_access_clock_;
             }
-            const auto version_before = block->version.load(std::memory_order_acquire);
-            {
-                std::lock_guard<std::mutex> lock(replicas_mutex_);
-                const auto cached = replicas_.find(cache_key);
-                if (cached != replicas_.end() && cached->second.object_offset == object.offset &&
-                    cached->second.block_index == index && cached->second.version == version_before) {
-                    cached->second.last_access = ++replica_access_clock_;
-                    replica = cached->second.storage;
-                    accepted_version = version_before;
-                }
-            }
-            if (replica != nullptr)
-                break;
-            auto refreshed = std::make_shared<std::vector<std::byte>>(block_bytes);
-            const auto data_status = AcquireData(static_cast<std::byte*>(region_mapper_.base()) + object.offset +
-                                                     block_start,
-                                                 block_bytes, VisibilityMode::kReleaseAcquire);
-            if (!data_status.ok())
-                return data_status;
-            std::memcpy(refreshed->data(), static_cast<std::byte*>(region_mapper_.base()) + object.offset + block_start,
-                        block_bytes);
-            const auto verify_status = AcquireData(block, sizeof(*block), VisibilityMode::kReleaseAcquire);
-            if (!verify_status.ok())
-                return verify_status;
-            const auto epoch_after = block->writeback_epoch.load(std::memory_order_acquire);
-            const auto version_after = block->version.load(std::memory_order_acquire);
-            if (epoch_before != epoch_after || (epoch_after & 1U) != 0 || version_before != version_after) {
-                std::this_thread::yield();
-                continue;
-            }
-            replica = std::move(refreshed);
-            accepted_version = version_after;
-            CacheReplica(cache_key, object.offset, index, version_after, replica);
-            break;
         }
-        if (replica == nullptr)
-            return Status::Unavailable("timed out waiting for a stable readable block version");
+        if (!replica) {
+            const auto status = admit();
+            if (!status.ok()) return status;
+            const auto block_result = allocator->MutableCoherenceBlock(object, index, true);
+            if (!block_result.ok()) return block_result.status();
+            auto* block = block_result.value();
+            while (std::chrono::steady_clock::now() < deadline) {
+                auto metadata_status = AcquireData(block, sizeof(*block), VisibilityMode::kReleaseAcquire);
+                if (!metadata_status.ok()) return metadata_status;
+                const auto epoch_before = block->writeback_epoch.load(std::memory_order_acquire);
+                if (epoch_before & 1U) { std::this_thread::yield(); continue; }
+                const auto version_before = block->version.load(std::memory_order_acquire);
+                {
+                    std::lock_guard<std::mutex> lock(replicas_mutex_);
+                    const auto old = old_replicas_.find(cache_key);
+                    if (old != old_replicas_.end() && old->second.version == version_before)
+                        replica = old->second.storage;
+                }
+                if (!replica) {
+                    auto refreshed = std::make_shared<std::vector<std::byte>>(block_bytes);
+                    const auto data_status = AcquireData(static_cast<std::byte*>(region_mapper_.base()) +
+                        object.offset + block_start, block_bytes, VisibilityMode::kReleaseAcquire);
+                    if (!data_status.ok()) return data_status;
+                    std::memcpy(refreshed->data(), static_cast<std::byte*>(region_mapper_.base()) +
+                                object.offset + block_start, block_bytes);
+                    replica = std::move(refreshed);
+                }
+                metadata_status = AcquireData(block, sizeof(*block), VisibilityMode::kReleaseAcquire);
+                if (!metadata_status.ok()) return metadata_status;
+                const auto epoch_after = block->writeback_epoch.load(std::memory_order_acquire);
+                const auto version_after = block->version.load(std::memory_order_acquire);
+                if (epoch_before != epoch_after || (epoch_after & 1U) || version_before != version_after) {
+                    replica.reset();
+                    std::this_thread::yield();
+                    continue;
+                }
+                accepted_version = version_after;
+                std::lock_guard<std::mutex> lock(replicas_mutex_);
+                CacheReplicaLocked(cache_key, info, descriptor, index, accepted_version, replica);
+                break;
+            }
+        }
+        if (!replica) return Status::Unavailable("timed out waiting for a stable readable block version");
         if (first_block == last_block && offset == block_start && bytes == block_bytes)
             single_block_replica = replica;
         versions.push_back(accepted_version);
@@ -815,6 +919,9 @@ Result<WriteBuffer> LoomMemRuntime::AcquireWriteRange(GlobalPointer object, std:
 Status LoomMemRuntime::ReleaseWriteBuffer(const WriteBuffer& write) {
     if (!initialized_ || write.storage == nullptr || !write.reference_guard)
         return Status::FailedPrecondition("write buffer requires an initialized runtime and storage");
+    std::shared_lock<std::shared_mutex> boundary(replica_boundary_mutex_);
+    auto mutex = LocalObjectMutex(write.lease.object.offset);
+    std::lock_guard<std::mutex> object_lock(*mutex);
     auto* shared_allocator = allocator_.get();
     const auto descriptor_result = shared_allocator->MutableDescriptor(write.lease.object, true);
     if (!descriptor_result.ok())
@@ -838,7 +945,15 @@ Status LoomMemRuntime::ReleaseWriteBuffer(const WriteBuffer& write) {
         const auto copy_end = std::min(write.offset + write.storage->size(), block_end);
         std::memcpy(static_cast<std::byte*>(region_mapper_.base()) + write.lease.object.offset + copy_begin,
                     write.storage->data() + (copy_begin - write.offset), copy_end - copy_begin);
-        const auto release_status = ReleaseWriteToken(lease);
+        const auto release_status = token_service_->Release(lease);
+        {
+            std::lock_guard<std::mutex> lock(replicas_mutex_);
+            const auto key = descriptor->coherence_metadata_offset + lease.block_index * sizeof(CoherenceBlockDescriptor);
+            for (auto* index : {&replicas_, &old_replicas_}) {
+                const auto entry = index->find(key);
+                if (entry != index->end()) EraseReplicaLocked(*index, entry);
+            }
+        }
         if (!release_status.ok()) {
             for (std::size_t remaining = lease_index + 1; remaining < leases.size(); ++remaining)
                 token_service_->Release(leases[remaining], false);
@@ -904,12 +1019,12 @@ Status LoomMemRuntime::SynchronizeRelease() {
 
 Status LoomMemRuntime::SynchronizeAcquire() {
     if (!initialized_) return Status::FailedPrecondition("acquire requires initialized LoomMem");
+    std::unique_lock<std::shared_mutex> boundary(replica_boundary_mutex_);
     std::atomic_thread_fence(std::memory_order_acquire);
     std::lock_guard<std::mutex> lock(replicas_mutex_);
-    replicas_.clear();
-    cached_replica_bytes_ = 0;
-    // Existing immutable snapshots retain their storage. Subsequent reads validate
-    // versions and fetch through AcquireReadRange rather than mutating old snapshots.
+    while (!old_replicas_.empty()) EraseReplicaLocked(old_replicas_, old_replicas_.begin());
+    old_replicas_.swap(replicas_);
+    // Current is empty. Old blocks are validated lazily after this boundary.
     return Status::Ok();
 }
 

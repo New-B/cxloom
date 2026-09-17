@@ -41,6 +41,9 @@ class Context {
     friend Result<class WriteView> clWriteRange(Context&, GPtr, std::uint64_t, std::uint64_t,
                                                  std::uint64_t);
     friend Status clFree(Context&, GPtr);
+    friend Status clInvalidate(Context&, GPtr);
+    friend Status clSynchronizeAcquire(Context&);
+    friend Status clSynchronizeRelease(Context&);
     friend class WriteView;
 };
 
@@ -88,15 +91,24 @@ class WriteView {
 };
 
 Result<std::unique_ptr<Context>> clInit(CxloomConfig config);
+// On failure the context is retained; finish outstanding activity and retry.
 Status clDestroy(std::unique_ptr<Context>& context);
 
 Result<GPtr> clAlloc(Context& context, std::size_t bytes, std::size_t alignment);
 Result<GPtr> clAlloc(Context& context, const AllocOptions& options);
 
-// Reads validate each block independently; multi-block results need not share a point in time.
+// Current-interval cache hits use DRAM directly. After an acquire boundary,
+// blocks are validated lazily; multi-block results need not share a point in time.
 Result<ReadView> clRead(Context& context, GPtr object, std::uint64_t timeout_ms = 10000);
 Result<ReadView> clReadRange(Context& context, GPtr object, std::uint64_t offset,
                              std::uint64_t bytes, std::uint64_t timeout_ms = 10000);
+
+// Drop this host's cached blocks without invalidating already returned views.
+Status clInvalidate(Context& context, GPtr object);
+// Pair these with application synchronization: release before publishing the
+// synchronization event, acquire after observing it. Acquire rotates caches.
+Status clSynchronizeRelease(Context& context);
+Status clSynchronizeAcquire(Context& context);
 
 // Commits publish blocks independently, including for full-object writes.
 Result<WriteView> clWrite(Context& context, GPtr object, std::uint64_t timeout_ms = 10000);

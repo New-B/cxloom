@@ -142,6 +142,10 @@ int main() {
       ++errors;
       break;
     }
+    if (!runtime.SynchronizeAcquire().ok()) {
+      ++errors;
+      break;
+    }
   }
 
   const auto final_snapshot =
