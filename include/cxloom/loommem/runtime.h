@@ -83,6 +83,9 @@ class LoomMemRuntime {
     Status PublishObservedSequence(std::uint64_t sequence, std::uint64_t errors, VisibilityMode mode);
     Status WaitForObservedSequence(std::uint64_t sequence, std::uint64_t timeout_ms, VisibilityMode mode) const;
     std::uint64_t visibility_error_count() const;
+    // Advisory per-block observations, not an atomic snapshot of the whole range.
+    // May return Unavailable during concurrent publication; callers can retry.
+    Result<std::vector<BlockLocality>> QueryLocality(const WorkingSetEntry& entry) const;
     Result<HostId> ResolvePreferredHost(const GlobalPointer& gptr) const;
     Result<SpscQueue*> GetQueue(HostId producer, HostId consumer);
     Status StartQueuePoller(QueueMessageHandler handler = {}, QueuePollerOptions options = {});
@@ -100,7 +103,7 @@ class LoomMemRuntime {
                                           std::uint64_t bytes, std::uint64_t timeout_ms);
     Status ReleaseWriteBuffer(const WriteBuffer& write);
     Status AbortWriteBuffer(const WriteBuffer& write);
-    // Transfers a buffer to the calling thread's next release boundary.
+    // Transfers a buffer to the calling execution context's next release boundary.
     Status StageWriteBuffer(WriteBuffer* write);
     Status SynchronizeRelease();
     Status SynchronizeAcquire();
@@ -149,7 +152,7 @@ class LoomMemRuntime {
     std::size_t cached_replica_bytes_ {0};
     std::uint64_t replica_access_clock_ {0};
     mutable std::mutex staged_mutex_;
-    std::unordered_map<std::thread::id, std::vector<WriteBuffer>> staged_writes_;
+    std::unordered_map<std::uint64_t, std::vector<WriteBuffer>> staged_writes_;
     bool initialized_ {false};
 
     Status ProgressRetirement();

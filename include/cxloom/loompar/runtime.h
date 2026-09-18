@@ -10,6 +10,7 @@
 #include "cxloom/common/types.h"
 #include "cxloom/loommem/runtime.h"
 #include "cxloom/loompar/barrier.h"
+#include "cxloom/loompar/cluster_registry.h"
 #include "cxloom/loompar/scheduler.h"
 #include "cxloom/loompar/threading.h"
 
@@ -23,12 +24,16 @@ public:
     Status Initialize();
     Status Finalize();
 
+    Status RegisterClusterFunctions(std::vector<ClusterFunction> functions, std::uint64_t timeout_ms);
+    Result<GlobalThreadId> CreateRegisteredThread(std::uintptr_t identity, std::vector<std::byte> args, const ThreadPlacementHint& hint = {});
+    bool has_cluster_manifest() const { return cluster_registry_.installed(); }
     Result<std::uint64_t> RegisterFunction(const std::string& name, ThreadFunction function);
     Result<GlobalThreadId> CreateThread(const std::string& function_name,
                                         std::vector<std::byte> arg_bytes,
                                         const ThreadPlacementHint& hint,
                                         std::function<std::uint64_t()> result = {});
-    Status JoinThread(const GlobalThreadId& gtid);
+    Status JoinThread(const GlobalThreadId& gtid, std::uint64_t* result = nullptr);
+    Status DetachThread(const GlobalThreadId& gtid);
     // All configured hosts participate. Count is fixed per host and barrier ID.
     Status Barrier(std::uint64_t barrier_id, std::size_t local_participants);
 
@@ -37,7 +42,11 @@ public:
     PlacementScheduler& scheduler() { return scheduler_; }
 
 private:
+    Result<GlobalThreadId> LaunchThread(std::uint64_t id, ThreadFunction function,
+                                       std::vector<std::byte> args, const ThreadPlacementHint& hint,
+                                       std::function<std::uint64_t()> result, bool cluster);
     std::vector<HostLoadSnapshot> BuildLocalLoadView() const;
+    ExecutionLoad SampleExecutionLoad() const;
     Status HandleMessage(loommem::QueueEnvelope message);
     void Progress();
     void Enqueue(loommem::QueueEnvelope message);
@@ -57,6 +66,8 @@ private:
     loommem::LoomMemRuntime* loommem_ {nullptr};
     ThreadManager thread_manager_;
     FunctionRegistry function_registry_;
+    ClusterFunctionRegistry cluster_registry_;
+    std::atomic<std::size_t> active_manifest_calls_{0};
     PlacementScheduler scheduler_;
     BarrierManager barrier_manager_;
     std::atomic<std::size_t> active_barriers_ {0};

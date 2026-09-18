@@ -7,46 +7,87 @@ namespace cxloom::loompar {
 
 namespace {
 thread_local GlobalThreadId current_gtid{};
+thread_local ThreadManager* current_manager = nullptr;
+thread_local std::uint64_t* current_result = nullptr;
 }
 
 ThreadManager::ThreadManager(HostId local_host) : local_host_(local_host) {
     const unsigned count = std::min<unsigned>(4, std::max<unsigned>(2, std::thread::hardware_concurrency()));
-    for (unsigned i = 0; i < count; ++i) workers_.emplace_back(&ThreadManager::WorkerLoop, this);
+    for (unsigned i = 0; i < count; ++i) workers_.emplace_back(&ThreadManager::WorkerLoop, this, i);
 }
 
 ThreadManager::~ThreadManager() {
     { std::lock_guard<std::mutex> lock(mutex_); stopping_ = true; }
     ready_cv_.notify_all();
     for (auto& worker : workers_) if (worker.joinable()) worker.join();
-    std::vector<std::shared_ptr<Entry>> entries;
-    { std::lock_guard<std::mutex> lock(mutex_);
-      for (auto& item : records_) entries.push_back(item.second); }
 }
 
-void ThreadManager::WorkerLoop() {
+ExecutionLoad ThreadManager::SampleExecutionLoad() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ExecutionLoad load;
+    load.workers = static_cast<std::uint32_t>(workers_.size());
+    load.executing = executing_;
+    // Only queued fibers are inspected: a running fiber changes wait state
+    // outside this mutex. Ready-list membership provides the handoff boundary.
+    for (const auto& entry : ready_) {
+        if (entry->fiber->runnable()) ++load.ready;
+        else ++load.blocked;
+    }
+    return load;
+}
+
+void ThreadManager::WorkerLoop(unsigned worker) {
     for (;;) {
         std::shared_ptr<Entry> entry;
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            ready_cv_.wait(lock, [&] { return stopping_ || !ready_.empty(); });
-            if (stopping_ && ready_.empty()) return;
-            entry = std::move(ready_.front());
-            ready_.pop_front();
-            entry->queued = false;
+            for (;;) {
+                auto next = std::find_if(ready_.begin(), ready_.end(), [&](const auto& candidate) {
+                    return (candidate->worker < 0 || candidate->worker == static_cast<int>(worker)) &&
+                           candidate->fiber->runnable();
+                });
+                if (next != ready_.end()) {
+                    entry = *next;
+                    ready_.erase(next);
+                    entry->worker = static_cast<int>(worker);
+                    entry->fiber->TransferOwnership(worker);
+                    entry->queued = false;
+                    ++executing_;
+                    break;
+                }
+                if (stopping_ && ready_.empty()) return;
+                // Parked contexts remain pinned. Poll deadlines/notifications at
+                // a bounded interval without consuming a worker in the callback.
+                if (ready_.empty()) ready_cv_.wait(lock);
+                else ready_cv_.wait_for(lock, std::chrono::milliseconds(1));
+            }
         }
-        if (!entry->fiber || entry->fiber->done()) continue;
-        entry->fiber->Resume();
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (entry->record.migration_state == MigrationState::kQuiesced)
-            entry->record.migration_state = MigrationState::kResumed;
-        if (!entry->fiber->done() && !stopping_ && !entry->queued) {
+        current_gtid = entry->record.gtid;
+        current_manager = this;
+        current_result = &entry->result;
+        auto resumed = entry->fiber->Resume();
+        current_result = nullptr;
+        current_manager = nullptr;
+        current_gtid = {};
+        if (!resumed.ok()) entry->exit_code = -1;
+        if (entry->fiber->done() || !resumed.ok()) {
+            // Completion is observable only after leaving the stack. In
+            // particular a detached record must not destroy an executing fiber.
+            entry->fiber.reset();
+            { std::lock_guard<std::mutex> lock(mutex_); --executing_; }
+            if (entry->on_complete) entry->on_complete();
+            MarkCompleted(entry->record.gtid, entry->exit_code, entry->result);
+        } else {
+            std::lock_guard<std::mutex> lock(mutex_);
+            --executing_;
+            if (entry->record.migration_state == MigrationState::kQuiesced)
+                entry->record.migration_state = MigrationState::kResumed;
             entry->queued = true;
             ready_.push_back(entry);
-            ready_cv_.notify_one();
+            ready_cv_.notify_all();
         }
     }
 }
-
 
 Result<GlobalThreadId> ThreadManager::AllocateThread(HostId execution_host, std::uint64_t function_id,
                                                      std::vector<std::byte> arg_bytes) {
@@ -92,13 +133,15 @@ Status ThreadManager::MarkCompleted(const GlobalThreadId& gtid, std::int32_t exi
     entry.record.result_value = result_value;
     entry.record.state = ThreadState::kCompleted;
     entry.completed.notify_all();
+    if (entry.detached) records_.erase(it);
     return Status::Ok();
 }
 
 Status ThreadManager::Launch(const GlobalThreadId& gtid, ThreadFunction function,
                              std::function<Status()> acquire, std::function<Status()> release,
                              std::function<std::uint64_t()> result,
-                             std::function<std::vector<std::byte>()> result_bytes) {
+                             std::function<std::vector<std::byte>()> result_bytes,
+                             std::function<void()> on_complete) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = records_.find(gtid.local_tid);
     if (gtid.home_host != local_host_ || it == records_.end()) return Status::NotFound("unknown home thread");
@@ -106,25 +149,28 @@ Status ThreadManager::Launch(const GlobalThreadId& gtid, ThreadFunction function
     if (!function || entry->record.state != ThreadState::kLaunching)
         return Status::FailedPrecondition("launch requires a registered function and launching thread");
     try {
-        entry->fiber = std::make_unique<Fiber>(64 * 1024, [this, entry, args = std::move(entry->record.arg_bytes), function, gtid, acquire = std::move(acquire), release = std::move(release), result = std::move(result), result_bytes = std::move(result_bytes)]() mutable {
-            current_gtid = gtid;
+        entry->on_complete = std::move(on_complete);
+        entry->fiber = std::make_unique<Fiber>(64 * 1024, [this, entry = entry.get(), args = std::move(entry->record.arg_bytes), function, acquire = std::move(acquire), release = std::move(release), result = std::move(result), result_bytes = std::move(result_bytes)]() mutable {
             std::int32_t code = 0;
             try {
                 if (acquire && !acquire().ok()) code = -1;
-            if (!code) function(args.empty() ? nullptr : args.data());
-            if (!code && result) entry->record.result_value = result();
-            if (!code && result_bytes) entry->record.result_bytes = result_bytes();
+                if (!code) function(args.empty() ? nullptr : args.data());
+                if (!code && result) entry->result = result();
+                if (!code && result_bytes) {
+                    auto bytes = result_bytes();
+                    std::lock_guard<std::mutex> guard(mutex_);
+                    entry->record.result_bytes = std::move(bytes);
+                }
             }
             catch (...) { code = -1; }
             try { if (release && !release().ok()) code = -1; }
             catch (...) { code = -1; }
-            MarkCompleted(gtid, code);
-            current_gtid = {};
+            entry->exit_code = code;
         });
         entry->record.state = ThreadState::kRunning;
         entry->queued = true;
         ready_.push_back(entry);
-        ready_cv_.notify_one();
+        ready_cv_.notify_all();
     } catch (const std::exception& error) {
         entry->record.state = ThreadState::kCompleted;
         entry->record.exit_code = -1;
@@ -140,10 +186,9 @@ Status ThreadManager::MigrationSafePoint(const GlobalThreadId& gtid) {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = records_.find(gtid.local_tid);
         if (gtid.home_host != local_host_ || it == records_.end()) return Status::NotFound("unknown thread");
-        if (current_gtid.home_host != gtid.home_host || current_gtid.local_tid != gtid.local_tid ||
+        if (current_manager != this || current_gtid.home_host != gtid.home_host || current_gtid.local_tid != gtid.local_tid ||
             Fiber::Current() != it->second->fiber.get())
             return Status::FailedPrecondition("safe point must be called by the running fiber");
-        it->second->record.migration_epoch++;
         if (it->second->record.migration_state == MigrationState::kRequested)
             it->second->record.migration_state = MigrationState::kQuiesced;
         fiber = it->second->fiber.get();
@@ -166,15 +211,22 @@ Status ThreadManager::RequestMigration(const GlobalThreadId& gtid, HostId target
 }
 
 GlobalThreadId ThreadManager::CurrentGtid() { return current_gtid; }
+void ThreadManager::SetCurrentResult(std::uint64_t value) {
+    if (current_result) *current_result = value;
+}
+Status ThreadManager::CurrentSafePoint() {
+    if (!current_manager) return Status::FailedPrecondition("safe point requires a LoomPar callback");
+    return current_manager->MigrationSafePoint(current_gtid);
+}
 
-Status ThreadManager::Join(const GlobalThreadId& gtid, std::function<Status()> acquire) {
+Status ThreadManager::Join(const GlobalThreadId& gtid, std::function<Status()> acquire, std::uint64_t* result) {
     std::unique_lock<std::mutex> lock(mutex_);
     auto it = records_.find(gtid.local_tid);
     if (gtid.home_host != local_host_ || it == records_.end()) return Status::NotFound("unknown home thread");
     auto entry = it->second;
-    if (entry->fiber && Fiber::Current() == entry->fiber.get())
+    if (current_manager == this && current_gtid == gtid)
         return Status::FailedPrecondition("thread cannot join itself");
-    if (entry->joining) return Status::FailedPrecondition("thread already has a joiner");
+    if (entry->joining || entry->detached) return Status::FailedPrecondition("thread is joined or detached");
     if (entry->record.state == ThreadState::kAllocated)
         return Status::FailedPrecondition("thread has not launched");
     entry->joining = true;
@@ -184,6 +236,7 @@ Status ThreadManager::Join(const GlobalThreadId& gtid, std::function<Status()> a
     try { if (acquire) acquire_status = acquire(); }
     catch (...) { acquire_status = Status::Internal("join acquire hook failed"); }
     lock.lock();
+    if (result) *result = entry->record.result_value;
     entry->record.state = ThreadState::kJoined;
     records_.erase(gtid.local_tid);
     if (!acquire_status.ok()) return acquire_status;
@@ -198,8 +251,9 @@ Status ThreadManager::Detach(const GlobalThreadId& gtid) {
     if (gtid.home_host != local_host_ || it == records_.end()) return Status::NotFound("unknown home thread");
     auto entry = it->second;
     if (entry->record.state == ThreadState::kAllocated) return Status::FailedPrecondition("thread has not launched");
-    if (entry->joining) return Status::FailedPrecondition("thread is already being joined");
-    records_.erase(it);
+    if (entry->joining || entry->detached) return Status::FailedPrecondition("thread is joined or detached");
+    entry->detached = true;
+    if (entry->record.state == ThreadState::kCompleted) records_.erase(it);
     return Status::Ok();
 }
 

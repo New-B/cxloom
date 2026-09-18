@@ -1,9 +1,9 @@
 # CXLoom Design Understanding
 
-This note consolidates the current understanding of the two source documents:
+This note records the current design and implementation contract:
 
-- `CXL Pod一致性 - 论文设计.pdf` -> LoomMem
-- `LeoPar_to_EuroSys.pdf` -> LeoPar, to be adapted and renamed as LoomPar
+- the CXL shared-memory design -> LoomMem
+- the distributed execution design implemented by this repository -> LoomPar
 
 Its purpose is to give us an implementation-oriented shared model before coding the full CXLoom system.
 
@@ -94,7 +94,7 @@ Local metadata in each host's DRAM:
 - replica local address
 - cached / dirty state
 - local block version
-- optional residency / hotness information
+- local cache bookkeeping
 - local token-related transient state
 
 Rule:
@@ -171,7 +171,7 @@ This aligns naturally with LoomPar barriers.
 
 ### 3.8 CXL-Resident Control Plane
 
-The revised direction removes RDMA from the steady-state design.
+The current direction uses the shared CXL region for the steady-state control plane.
 
 CXL should carry:
 
@@ -231,16 +231,14 @@ free extents; retirement coalesces adjacent ranges. The inline descriptor exists
 only during the object's lifetime and does not change the pure-address GPtr
 contract.
 
-## 4. LoomPar: What LeoPar Contributes
+## 4. LoomPar Execution Model
 
-LeoPar provides the execution-layer model we want to adapt into LoomPar.
+The LoomPar execution layer keeps the data plane and computation plane separate:
 
-Its key idea is:
+- LoomMem owns shared data, coherence and visibility
+- LoomPar owns cross-host invocation, placement and lifecycle
 
-- DSM solves shared-data access
-- the runtime should separately solve cross-node thread execution
-
-LeoPar is intentionally:
+LoomPar is intentionally:
 
 - thread-centric
 - Pthreads-like
@@ -253,21 +251,16 @@ It does not move live stacks or continuations.
 
 ### 5.1 Programming Model
 
-LeoPar exposes a distributed thread abstraction with:
+The public API is an opaque C interface:
 
-- `leopar_init`
-- `leo_thread_create`
-- `leo_thread_join`
-- `leo_barrier`
-- `leo_world_size`
-- `leo_rank`
+- `cl_runtime_create` / `cl_runtime_destroy`
+- `cl_pthread_create` / `cl_pthread_join` / `cl_pthread_detach`
+- `cl_pthread_create_with_working_set`
+- reusable world barriers and distributed mutex/condition handles
 
-Adapted into LoomPar, the conceptual API should remain similar:
-
-- initialization/finalization
-- distributed create/join
-- barrier
-- placement-aware execution
+The C++ runtime and scheduler are internal integration interfaces. Multi-host
+callbacks use an immutable cluster function manifest; bounded argument bytes are
+serialized into queue messages and large shared data is passed by GPtr.
 
 ### 5.2 Pinned Cross-Host Threads
 
@@ -284,9 +277,7 @@ The only thing that moves is the launch decision, not live execution state.
 
 ### 5.3 Home Rank and Global Thread Identity
 
-LeoPar introduces:
-
-- `GTID = <home_rank, local_tid>`
+LoomPar uses `GTID = <home_host, local_tid>`:
 
 Semantically:
 
@@ -296,13 +287,11 @@ Semantically:
 The home side keeps authoritative lifecycle metadata.
 The execution side keeps only transient execution records.
 
-This is a very good fit for LoomPar as well.
+The home host owns lifecycle metadata; the execution host keeps transient records.
 
 ### 5.4 Remote Launch by Function Registration
 
-LeoPar does not ship code or stack state.
-
-Instead:
+LoomPar does not ship code or stack state. Instead:
 
 - functions are registered cluster-wide
 - a remote create sends compact metadata:
@@ -316,7 +305,7 @@ The remote side:
 - reconstructs local invocation
 - launches a native thread
 
-This is the right execution model to preserve in LoomPar even if the transport changes from UCX/RDMA to CXL queues.
+The remote side resolves the local callback binding and launches a pinned Fiber.
 
 ### 5.5 Lifecycle State Machine
 
@@ -344,46 +333,37 @@ This state machine should remain central in LoomPar.
 
 ### 5.6 Placement Scheduler
 
-LeoPar schedules at create time.
+LoomPar schedules at create time. The configured policies are:
 
-It supports:
+- memory-aware placement (the default)
+- round-robin over eligible hosts
+- least-loaded placement using execution telemetry
 
-- explicit placement if caller specifies target rank
-- round-robin as a cheap baseline
-- locality + load aware scheduling
+Memory-aware placement is based on:
 
-The locality-aware policy is based on:
+- the declared GPtr working set
+- token owner, last writer and current-version replica residency
+- executing, ready and blocked Fiber counts
+- queue pressure, admission limits and launch history
 
-- the dominant DSM region/address a thread is expected to use
-- approximate per-rank load views
-- a slack threshold that allows some extra load to preserve locality
-
-This is especially valuable for LoomPar because LoomMem can expose richer locality signals than a generic DSM backend.
+Working-set read/write types are user hints at create time; LoomMem remains the
+authority for actual access and consistency.
 
 ### 5.7 Barrier Semantics
 
-LeoPar's barrier is:
+LoomPar's barrier is:
 
 - a distributed phase-boundary primitive
 - separate from ordinary data-access semantics
 - responsible for aligning thread progress
-- dependent on the DSM backend to ensure data completion/visibility before barrier arrival
+- coupled to LoomMem release/acquire hooks so published writes become visible at the phase boundary
 
 This matches LoomMem's release-consistency design almost exactly.
 
-## 6. How LeoPar Must Change to Become LoomPar
+## 6. LoomPar Control Plane
 
-The biggest architectural shift is:
-
-- LeoPar originally used a DSM backend for data access and a UCX/RDMA control plane for execution control
-- LoomPar should use LoomMem's CXL substrate for both data and control
-
-So the adaptation path is:
-
-- old LeoPar: `DSM data plane + UCX control plane`
-- new LoomPar: `LoomMem shared CXL memory + CXL queue control plane`
-
-Concretely, UCX control messages should become CXL-queue messages such as:
+LoomPar uses LoomMem's shared CXL region for both data and control. Directed
+SPSC queues carry:
 
 - `CREATE_REQ`
 - `CREATE_ACK`
@@ -391,11 +371,11 @@ Concretely, UCX control messages should become CXL-queue messages such as:
 - `JOIN_WAKE` or equivalent local completion path
 - `BARRIER_ARRIVE`
 - `BARRIER_RELEASE`
-- token/coherence messages like `TOKEN_REQ` and `TOKEN_GRANT`
+- token/coherence messages such as `TOKEN_REQ` and `TOKEN_GRANT`
 
 ## 7. LoomMem <-> LoomPar Contract
 
-This is the key interface we will need before coding.
+This is the implemented co-design contract.
 
 LoomMem should provide LoomPar with:
 
@@ -407,7 +387,7 @@ LoomMem should provide LoomPar with:
 - locality hints:
   - token owner
   - last writer
-  - replica residency/hotness
+  - current-version replica residency
   - dominant object/block placement
 
 LoomPar should provide LoomMem with:
@@ -417,27 +397,25 @@ LoomPar should provide LoomMem with:
 - synchronization boundaries
 - execution-host decisions that may affect data movement pressure
 
-In other words:
+The division of responsibility is:
 
 - LoomMem knows where data state currently lives and how expensive it is to move coherence
 - LoomPar decides where to run threads so execution follows favorable memory/coherence state
 
-## 8. Most Important Joint Insight: Memory-Execution Co-Design
+## 8. Current Co-Design Boundary
 
-The strongest combined idea across the two documents is not just replacing transport.
-
-It is:
-
-- `move computation toward coherence state`
-
-Instead of always moving token ownership and data state toward the thread, LoomPar can place the thread near:
+LoomPar moves a new invocation toward the currently favorable coherence state,
+without moving a live stack or changing ownership merely to satisfy placement.
+It can use:
 
 - current token owner
-- hottest replica
+- a replica with the current published version
 - last writer
-- lowest expected coherence cost
+- execution load and admission state
 
-This is the clearest research-level differentiator of CXLoom.
+Replica access heat, hardware latency calibration and a learned cost model are
+explicitly deferred. The current cost is a deterministic heuristic used for
+placement, not a measured performance model.
 
 ## 9. Practical V1 Boundaries
 
@@ -453,7 +431,7 @@ The two documents together suggest a realistic first implementation target:
 - release-consistency synchronization
 - per-host-pair SPSC CXL queues
 - distributed thread create/join/barrier on top of those queues
-- initial placement policy using load + simple memory hint
+- initial placement policy using execution load plus current LoomMem state
 
 What should not be overcommitted in V1:
 
@@ -463,18 +441,37 @@ What should not be overcommitted in V1:
 - hard-coded coherence granularity
 - assuming specific CXL visibility primitives before measurement
 
-## 10. Immediate Engineering Priorities
+## 10. Current Status and Remaining Work
 
-Before implementing the whole system, the documents imply this order:
+The implementation has completed the core LoomPar path: local and remote
+create, cluster function registration, GTID home ownership, result-bearing join,
+detach reclamation, pinned Fiber execution, cooperative join/barrier/mutex/
+condition/token waits, release/acquire integration, execution-load telemetry,
+and memory-aware, round-robin and least-loaded placement. LoomMem now exposes
+per-block token owner, last writer and current-version replica residency.
 
-1. CXL visibility litmus tests
-2. shared-region bootstrap and global metadata layout
-3. SPSC queue transport in shared CXL memory
-4. global allocator and offset-based addressing
-5. token/version coherence for one block granularity
-6. LoomPar create/join control path over CXL queues
-7. barrier + release/acquire integration
-8. coherence-aware placement
+The remaining gaps are deliberately bounded:
+
+1. Host failure detection, failed remote invocation convergence and transparent
+   recovery are not implemented.
+2. Cancellation and deadline propagation for a running distributed invocation
+   are not implemented; timed waits only cover supported LoomPar wait points.
+3. Barrier membership is fixed per barrier ID. Dynamic cohorts, missing-host
+   recovery and barrier cancellation are not implemented.
+4. Arbitrary blocking system calls inside a Fiber still occupy a worker; only
+   LoomPar/LoomMem cooperative waits park the Fiber.
+5. Physical non-coherent multi-host CXL/DAX acceptance and performance
+   characterization remain pending. File-backed multi-process and container
+   tests validate protocol behavior, not hardware latency.
+6. Application benchmarks, token-transfer counters, queue latency, telemetry
+   ablations and granularity trade-offs remain to be measured.
+7. Automatic discovery of a callback's future working set, replica heat
+   tracking and calibrated/learned placement costs are deferred by design.
+
+Live-stack migration is not a remaining V1 requirement: LoomPar's current
+contract places an invocation at creation and keeps it pinned until completion.
+The migration transaction model is retained as an experimental future extension,
+but the runtime correctly rejects migration requests as unsupported.
 
 This order is important because ordering and visibility semantics constrain everything above them.
 
@@ -516,35 +513,13 @@ CXLoom should be implemented as a two-layer co-designed runtime:
 
 The most important architectural decision is that CXLoom should not treat memory and execution as separate afterthoughts. LoomMem exposes coherence state, and LoomPar should use that state to place threads where the total execution plus coherence cost is lowest.
 
-## 13. Implementation Scope Update (2026-09-05)
+## 13. Validation Scope
 
-The current delivery order overrides the validation-first engineering sequence
-in sections 3.9 and 10: LoomMem non-coherent multi-host validation is deferred
-and does not block LoomPar local or cross-container execution development.
-This does not establish non-coherent data visibility correctness.
-
-1. Real native local execution and blocking join, using the common GTID,
-   function registry and home-owned lifecycle interfaces.
-2. Cross-container create, acknowledgement, completion, join and reclamation
-   over the shared CXL queues.
-3. Synchronization and LoomMem release/acquire integration.
-4. Placement, resource control and an expanded cross-node/container thread
-   scheduling design. The extension must specify whether and how execution
-   can be rescheduled after creation; live stack/continuation migration is not
-   implemented by the current pinned execution milestone. Section 5.2 describes
-   the baseline, not a permanent restriction on this future extension.
-
-Host crashes and transparent recovery are outside the current version.
-See [LoomPar execution milestone](loompar-execution-milestone.md) for the
-implemented contract, validation evidence and remaining work.
-
-### Acceptance scale clarification
-
-All subsequent container validation and acceptance experiments use **16 containers**,
-not a minimal two-container deployment. The current execution milestone must cover
-remote argument delivery, completion and reclamation, concurrent creators, nested
-cross-host create/join and a long-running workload at that scale. Process-only
-regressions also use 16 hosts, but do not replace the required container acceptance.
+The reproducible acceptance workload uses 16 independent processes or containers
+with a shared file-backed region. It covers remote argument delivery, concurrent
+creators, nested cross-host create/join, result and detach reclamation, barriers,
+conditions, execution-load telemetry, and all three placement policies. This is
+protocol validation; it is not a claim of physical DAX or CXL performance.
 
 ## 14. Synchronization implementation contract
 
@@ -569,10 +544,11 @@ Physical non-coherent visibility validation remains deferred.
 
 ## 15. Application API boundary
 
-The public LoomPar programming model is an opaque C interface with
-`cl_pthread_create`, `cl_pthread_join`, and reusable barrier functions. The
-runtime internally derives function identity, serializes bounded arguments,
-selects execution hosts, performs admission and queue transport, manages GTIDs,
-and applies synchronization hooks. Applications do not provide placement hints
-or control messages. The C++ LoomPar classes remain internal implementation and
-test interfaces.
+The public LoomPar programming model is an opaque C interface with create,
+working-set create, join, detach, barrier, mutex, condition and memory APIs.
+Applications provide a working-set hint only when they want memory-aware
+placement; they do not provide control messages or remote callback addresses.
+The runtime resolves the immutable function manifest, serializes bounded
+arguments, selects a host, performs admission and queue transport, manages
+GTIDs, and applies LoomMem synchronization hooks. The C++ LoomPar classes remain
+internal implementation and test interfaces.

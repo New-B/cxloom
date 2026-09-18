@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -7,6 +9,7 @@
 #include <ucontext.h>
 
 #include "cxloom/common/status.h"
+#include "cxloom/common/execution_context.h"
 
 namespace cxloom::loompar {
 
@@ -23,6 +26,9 @@ class Fiber {
     Fiber(const Fiber&) = delete;
     Fiber& operator=(const Fiber&) = delete;
 
+    using WaitState = ExecutionWaitState;
+    void Park(std::shared_ptr<WaitState> state);
+    bool runnable() const;
     Status Resume();
     bool done() const { return done_; }
     bool at_safe_point() const { return safe_point_; }
@@ -34,6 +40,7 @@ class Fiber {
 
  private:
     std::unique_ptr<Impl> impl_;
+    std::shared_ptr<WaitState> wait_;
     bool done_{false};
     bool safe_point_{false};
     std::uint32_t owner_{0};

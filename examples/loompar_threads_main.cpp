@@ -39,8 +39,11 @@ void Worker(void* data) {
     if (argument.target != local_host || argument.value != 0xc001cafeULL || argument.depth > 1) throw 1;
     if (argument.depth) {
         auto child = Create((local_host + 1) % kHosts, 0);
-        if (!child.ok() || !runtime->JoinThread(child.value()).ok()) throw 2;
+        std::uint64_t result = 0;
+        if (!child.ok() || !runtime->JoinThread(child.value(), &result).ok() ||
+            result != 0xc001cafeULL + (local_host + 1) % kHosts) throw 2;
     }
+    loompar::ThreadManager::SetCurrentResult(argument.value + argument.target);
     ++executed;
 }
 void Missing(void*) {}
@@ -100,7 +103,9 @@ int main() {
                     const auto target = static_cast<HostId>((local_host + 1 + (peer - 1 + creator) % (kHosts - 1)) % kHosts);
                     auto id = Create(target, 1);
                     Require(id.status());
-                    Require(runtime->JoinThread(id.value()));
+                    std::uint64_t result = 0;
+                    Require(runtime->JoinThread(id.value(), &result));
+                    if (result != 0xc001cafeULL + target) std::exit(1);
                 }
             });
         }
@@ -123,6 +128,18 @@ int main() {
         if (par.JoinThread(missing.value()).ok()) return 1;
     }
     Phase(mem, 2ULL * rounds + 4);
+    // Detach must retain home authority until remote completion and return
+    // pending capacity even though no join will ever consume that record.
+    for (unsigned peer = 1; peer < kHosts; ++peer) {
+        auto id = Create((local_host + peer) % kHosts, 0);
+        Require(id.status()); Require(par.DetachThread(id.value()));
+    }
+    const auto detached_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (par.thread_manager().size()) {
+        if (std::chrono::steady_clock::now() >= detached_deadline) return 1;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    Phase(mem, 2ULL * rounds + 5);
     Require(par.Finalize());
     Require(mem.Finalize());
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();

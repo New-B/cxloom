@@ -3,8 +3,8 @@
 The public `cl_pthread_*` API exposes only a cooperative checkpoint,
 `cl_pthread_migration_safe_point(runtime)`. The callback must call it at a point
 where its state is represented by LoomPar metadata and GPtrs. The current
-runtime keeps a thread pinned after create; the checkpoint increments its
-epoch and yields the Fiber context. Completion messages carry the current
+runtime keeps a thread pinned after create; the checkpoint yields the Fiber context without changing its committed execution
+epoch. Ordinary cooperative waits also leave the epoch unchanged. Completion messages carry the current
 epoch, and stale notifications are discarded by the home runtime.
 
 1. The home host increments a migration epoch and sends `MIGRATE_REQ` only when
@@ -25,8 +25,9 @@ epoch, and stale notifications are discarded by the home runtime.
    and is intentionally outside the current version.
 
 `MigrationRequest` and `MigrationAck` are reserved internal message formats in
-`common/messages.h`; no handler currently accepts them. Implementing handlers
-requires a safe-point API and a serializable invocation context. `std::thread`
+`common/messages.h`; the runtime currently replies to migration requests with
+`Unimplemented`. Enabling successful migration requires a serializable invocation
+context and integration with the home transaction model. `std::thread`
 stacks, arbitrary callback locals, process-local pointers and unregistered
 function closures are not migratable. Host crashes and transparent recovery are
 also excluded. Request/ack handlers remain disabled until a resumable execution

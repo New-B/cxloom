@@ -22,7 +22,7 @@ class GlobalAllocator {
 
 inline constexpr std::uint64_t kAllocatorMagic = 0x43584c4f4f4d414cULL;
 inline constexpr std::uint64_t kAllocationMagic = 0x43584c4f4f4d4f42ULL;
-inline constexpr std::uint32_t kAllocatorLayoutVersion = 12;
+inline constexpr std::uint32_t kAllocatorLayoutVersion = 13;
 inline constexpr std::uint32_t kInvalidExtentIndex = UINT32_MAX;
 // Bounded shared metadata keeps the allocator header within the 256 KiB
 // allocator mapping while still allowing thousands of extents.
@@ -60,13 +60,16 @@ struct AllocationOptions {
 };
 
 inline constexpr std::uint64_t kCoherenceRegionMagic = 0x43584c4f4f4d4348ULL;
-inline constexpr std::uint32_t kCoherenceRegionLayoutVersion = 2;
+inline constexpr std::uint32_t kCoherenceRegionLayoutVersion = 3;
 
 struct alignas(64) CoherenceBlockDescriptor {
     std::atomic<std::uint32_t> token_owner {0};
     std::atomic<std::uint64_t> version {0};
     std::atomic<std::uint64_t> token_epoch {0};
     std::atomic<std::uint64_t> writeback_epoch {0};
+    std::atomic<std::uint32_t> last_writer {kMaxHosts};
+    // Version + 1, zero means absent. Updated only on cache install/eviction.
+    std::array<std::atomic<std::uint64_t>, kMaxHosts> replica_versions {};
 };
 
 struct alignas(64) CoherenceRegionHeader {

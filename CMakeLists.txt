@@ -27,6 +27,7 @@ target_include_directories(cxloom_loommem PUBLIC include)
 target_link_libraries(cxloom_loommem PUBLIC cxloom_common)
 
 add_library(cxloom_loompar STATIC
+    src/loompar/cluster_registry.cpp
     src/loompar/barrier.cpp
     src/loompar/fiber.cpp
     src/loompar/runtime.cpp
@@ -186,3 +187,48 @@ add_executable(cxloom_staged_write_api_test tests/staged_write_api_test.cpp)
 target_link_libraries(cxloom_staged_write_api_test PRIVATE cxloom)
 add_test(NAME cxloom_staged_write_api_test COMMAND cxloom_staged_write_api_test)
 set_tests_properties(cxloom_staged_write_api_test PROPERTIES TIMEOUT 30)
+
+add_executable(cxloom_loompar_regression_test tests/loompar_regression_test.cpp)
+target_link_libraries(cxloom_loompar_regression_test PRIVATE cxloom)
+add_test(NAME cxloom_loompar_regression_test COMMAND cxloom_loompar_regression_test)
+set_tests_properties(cxloom_loompar_regression_test PROPERTIES TIMEOUT 30)
+
+add_executable(cxloom_loompar_condition_process tests/loompar_condition_process.cpp)
+target_link_libraries(cxloom_loompar_condition_process PRIVATE cxloom)
+add_test(NAME cxloom_loompar_condition_process_test COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/loompar_process_test.py $<TARGET_FILE:cxloom_loompar_condition_process>)
+set_tests_properties(cxloom_loompar_condition_process_test PROPERTIES TIMEOUT 180)
+
+add_executable(cxloom_cluster_registry_test tests/cluster_registry_test.cpp)
+target_link_libraries(cxloom_cluster_registry_test PRIVATE cxloom_loompar)
+add_test(NAME cxloom_cluster_registry_test COMMAND cxloom_cluster_registry_test)
+set_tests_properties(cxloom_cluster_registry_test PROPERTIES TIMEOUT 30)
+
+add_executable(cxloom_loompar_cluster_process tests/loompar_cluster_process.cpp)
+target_link_libraries(cxloom_loompar_cluster_process PRIVATE cxloom)
+foreach(mode success missing schema abi timeout)
+    add_test(NAME cxloom_loompar_cluster_${mode}_test COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/loompar_process_test.py $<TARGET_FILE:cxloom_loompar_cluster_process> ${mode})
+    set_tests_properties(cxloom_loompar_cluster_${mode}_test PROPERTIES TIMEOUT 180)
+    if(mode STREQUAL "success" OR mode STREQUAL "timeout")
+        set_tests_properties(cxloom_loompar_cluster_${mode}_test PROPERTIES
+            ENVIRONMENT "CL_PAR_EXPECT_PRIMARY_INVOCATIONS=768")
+    endif()
+endforeach()
+
+add_executable(cxloom_loompar_locality_test tests/loompar_locality_test.cpp)
+target_link_libraries(cxloom_loompar_locality_test PRIVATE cxloom_loompar)
+add_test(NAME cxloom_loompar_locality_test COMMAND cxloom_loompar_locality_test)
+set_tests_properties(cxloom_loompar_locality_test PROPERTIES TIMEOUT 30)
+
+add_executable(cxloom_loompar_load_test tests/loompar_load_test.cpp)
+target_link_libraries(cxloom_loompar_load_test PRIVATE cxloom_loompar)
+add_test(NAME cxloom_loompar_load_test COMMAND cxloom_loompar_load_test)
+set_tests_properties(cxloom_loompar_load_test PROPERTIES TIMEOUT 30)
+
+foreach(policy 1 2)
+    add_test(NAME cxloom_loompar_policy_${policy}_process_test COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/loompar_process_test.py $<TARGET_FILE:cxloom_loompar_cluster_process> success)
+    set_tests_properties(cxloom_loompar_policy_${policy}_process_test PROPERTIES TIMEOUT 180
+        ENVIRONMENT "CL_PAR_EXPECT_PRIMARY_INVOCATIONS=768;CL_PAR_PLACEMENT_POLICY=${policy}")
+endforeach()

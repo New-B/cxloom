@@ -7,6 +7,7 @@
 #include <unordered_map>
 
 #include "cxloom/common/messages.h"
+#include "cxloom/loompar/condition.h"
 #include "cxloom/common/status.h"
 
 namespace cxloom::loompar {
@@ -36,7 +37,7 @@ private:
         std::uint64_t host_arrivals {0};
         bool reported {false};
         bool broken {false};
-        std::condition_variable ready;
+        Condition ready;
     };
     std::shared_ptr<Entry> Get(std::uint64_t id);
     void BreakLocked(Entry& entry);

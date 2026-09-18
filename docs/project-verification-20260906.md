@@ -1,37 +1,26 @@
-# 当前项目验证（2026-09-06）
+# 当前项目验证（更新至 2026-09-18）
 
-本次检查针对包含未提交改动的当前工作区；未覆盖或回退已有修改。
-
-## 完成情况
+本报告以当前工作区代码和 Debug 构建为准，替代 2026-09-06 的阶段性快照。
 
 | 范围 | 当前判断 |
 | --- | --- |
-| LoomMem / Phase 0–5B | 共享布局、分配回收、队列、token、块级一致性及用户 API 已实现，本次本地回归通过；历史 DAX 验证见基线报告，本次未重验 DAX。 |
-| LoomPar / Phase 6–7 | 本地及远程 create/join、嵌套创建、代际 barrier 和内存发布同步已实现，16 进程验证通过；容器 DAX 验收仍待完成。 |
-| Phase 8 | 调度策略、负载信息、准入限制及迁移事务模型已有实现和测试；仍属部分完成。运行时收到迁移请求明确返回 kUnimplemented，跨进程 continuation 迁移未完成。 |
-| Phase 9 | 已有微基准和压力验证入口；真实容器调度性能、应用评估、故障恢复及系统性硬化尚未完成。 |
+| LoomMem / Phase 0–5B | 共享布局、GPtr 分配回收、SPSC 队列、token、块级版本一致性、缓存版本跟踪和 C API 已实现并通过回归。物理非一致 CXL/DAX 验证仍受环境限制。 |
+| LoomPar / Phase 6–7 | 集群函数注册、远程 create、返回值、join、detach、Fiber 阻塞调度、barrier、分布式 mutex/condition 和 release/acquire 边界已实现。固定世界成员模型和缺少主机恢复仍是边界。 |
+| Phase 8 | 内存感知、轮询、最小负载三种放置策略已实现；执行负载区分 executing/ready/blocked，并通过版本化 LOAD_UPDATE 广播。副本热度和测量型成本模型按当前范围暂不实现。 |
+| Phase 9 | 性能基准、物理 CXL 验收、故障注入、主机故障恢复、取消/截止时间和应用评估仍未完成。 |
 
-README 的 Current Status 和部分里程碑文字落后于当前代码；不能据此认为项目仍仅有生命周期实现，也不能将迁移模型测试通过视为真实迁移完成。
+## 当前实测
 
-## 本次实测
-
-- 新建 `build/verification-20260906`，以 Debug 配置完整编译成功。
-- CTest **22/22 通过**，总耗时 **10.05 秒**，包括 LoomMem、C API、调度、资源限制、fiber、迁移模型及两项 16 进程测试。
-- 补充线程压力验证：16 个独立文件映射进程，每主机 4 个创建者、30 轮；**16/16 PASS**，每主机执行 3,600 次，总计 **57,600 次**，检查嵌套 create/join 和每轮线程记录回收；host 15 报告耗时 54.227 秒。
-- 补充同步验证：**16/16 PASS**，每主机 1–2 个参与者、固定 **24 轮**，验证 create/join 发布、barrier 代际可见性、参与数冲突传播及失败后的继续运行。同步程序不读取 CL_PAR_ROUNDS，日志文件名中的 30rounds 仅反映调用参数，实际为 24 轮。
-- 调度模拟基准成功复现已有报告：队列压力场景加权策略平均延迟为 2，轮转为 4；偏斜工作负载下加权策略 P95 为 903，轮转为 848。单位是模拟单位，不能证明真实 DAX 性能提升。
+- Debug 构建成功，CTest **38/38 通过**。
+- 覆盖 LoomMem 分配、回收、token、块范围、读写缓存和跨主机一致性。
+- 覆盖 LoomPar 本地与 16 主机远程生命周期、嵌套 create/join、返回值、detach 回收和队列背压。
+- 覆盖 cluster manifest 的缺失、schema、ABI、超时和成功场景。
+- 覆盖 Fiber 阻塞、就绪队列、worker 归一化、遥测延迟预测和容量限制。
+- 额外 16 主机场景分别强制 round-robin 与 least-loaded，均通过远程启动、join 和回收检查。
 - `git diff --check` 通过。
 
-## 16 容器启动阻塞
+## 运行边界
 
-实际执行了 `bash scripts/launch-numa-containers.sh 16`，在镜像预检阶段退出，未启动容器。直接调用 Docker 确认错误为：
+共享文件映射和容器脚本验证协议行为，不等同于物理多机非一致 CXL 的可见性或性能证明。运行中 Fiber/continuation 迁移不属于 pinned V1 契约；仓库中的迁移事务模型是未来实验接口，运行时收到迁移请求仍会返回 unsupported。
 
-```text
-dial unix /var/run/docker.sock: socket: operation not permitted
-```
-
-启动脚本将所有 `docker image inspect` 失败都显示为镜像缺失，因此其 “Docker image cxloom:dev is missing” 输出不能证明镜像不存在。当前执行环境也未暴露 `/dev/dax*`。环境禁止提权，无法在本会话完成容器启动；没有运行 DAX 工作负载或格式化 DAX 区域。
-
-在允许访问 Docker 且具备 DAX 设备的环境中，仍需启动或确认 16 个容器，检查 NUMA 绑定，然后依次运行 host-init、queue、token、coherence、LoomPar threads 和 sync 验收。共享区域会由各项测试重新初始化，必须串行运行这些测试。
-
-本次日志保存在 `run/verification-20260906/`：`configure.log`、`build.log`、`ctest.log`、`container-launch.log`、`docker-access.log`、两个 `*16hosts*` 日志及 `scheduler.csv`。该目录被 Git 忽略。
+下一阶段应优先补齐故障检测与清理、取消/截止时间、动态 barrier 成员、任意阻塞系统调用隔离，以及真实 CXL 环境下的延迟、吞吐、token 转移和队列指标。

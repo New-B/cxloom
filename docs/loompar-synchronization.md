@@ -12,7 +12,7 @@ all multi-host regression and container acceptance runs use 16 hosts.
 
 Each host supplies a positive local participant count, fixed for that barrier ID
 for the runtime's lifetime. Counts may differ across hosts (the integration test
-uses 1 on even hosts and 2 on odd hosts). A participant is a calling native thread
+uses 1 on even hosts and 2 on odd hosts). A participant is a calling native thread or LoomPar fiber
 on the execution host, regardless of its GTID's home. Application main threads and
 LoomPar workers can participate. Each member of the application-defined cohort
 calls once per round. GTIDs are not used as barrier membership identities. Counts
@@ -24,8 +24,9 @@ Generations begin at zero and advance only on global completion. Local calls
 aggregate under a mutex; the last local participant enqueues one BARRIER_ARRIVE
 for coordinator host 0. The coordinator tracks one bit per host, including its
 own local cohort. Only a full host bitmap produces BARRIER_RELEASE for that
-barrier ID and generation. Each host wakes its local waiters using a condition
-variable. Neither native waiters nor the poller spin waiting for barrier completion.
+barrier ID and generation. Each host notifies its local waiter queue. Native waiters sleep on a condition
+variable; fibers park and release their worker until notification. Neither native
+waiters nor the poller spin waiting for barrier completion.
 Outbound messages use the existing progress queue, keeping the inbound poller free
 to handle arrivals, releases, creates, completions and token traffic.
 
@@ -48,7 +49,7 @@ all task, token and retirement traffic is drained before shutting down pollers.
 | --- | --- |
 | Before successful create dispatch | Creator calls SynchronizeRelease before allocating/launching the home record or enqueuing CREATE_REQ. Invalid name/placement/argument requests do not publish. |
 | Before worker function entry | The execution thread calls SynchronizeAcquire before invoking the registered function, locally and remotely. |
-| Before completion | The worker calls SynchronizeRelease before MarkCompleted; remote COMPLETE_NOTIFY follows native execution reclamation. |
+| Before completion | The worker calls SynchronizeRelease before MarkCompleted; remote COMPLETE_NOTIFY follows fiber execution reclamation. |
 | Before join returns after completion | The joining thread calls SynchronizeAcquire after observing completion, including failed execution, and then removes the home record. Invalid joins do not acquire. |
 | Barrier arrival/return | Every participant calls SynchronizeRelease before contributing an arrival and SynchronizeAcquire after the matching global release. |
 
@@ -90,25 +91,25 @@ if (!status.ok()) return status;
 ```
 
 `Stage()` uses the same runtime staging mechanism as `StageWriteBuffer` below.
-It binds the write to the calling native thread, even if a different thread
+It binds the write to the calling execution context (fiber or native thread), even if a different context
 originally acquired the view. The ownership transfer between threads must be
 synchronized by the application. Successful staging disables `data`, `Commit`,
 `Abort`, and repeated `Stage` calls on that view; its destructor no longer aborts
 the buffer. On failure an active view remains owned by the application.
 `clDestroy` rejects a context containing staged writes and retains it for retry.
-The staging thread must release before exiting; another thread's release does
-not drain its pending writes. No acquire boundary publishes staged writes.
+The staging execution context must release before exiting; another context's
+release does not drain its pending writes. No acquire boundary publishes staged writes.
 
 StageWriteBuffer requires exclusive ownership of the buffer's storage and object
-reference. It empties the source buffer and stores it under the staging native
-thread's ID. Do not retain raw mutable aliases, make new aliases, mutate a staged
+reference. It empties the source buffer and stores it under the staging
+execution context's ID. Do not retain raw mutable aliases, make new aliases, mutate a staged
 buffer, or try to release it again. A staging thread can differ from the thread
 that acquired the buffer only through a properly synchronized ownership transfer.
 Staging keeps tokens held until the next release: reacquiring the same held block
 before releasing it is invalid application usage and can wait for its own token.
 
-SynchronizeRelease commits only the calling thread's staged buffers, in staging
-order, through ReleaseWriteBuffer. Other threads' staged buffers are unaffected.
+SynchronizeRelease commits only the calling execution context's staged buffers, in staging
+order, through ReleaseWriteBuffer. Other contexts' staged buffers are unaffected, including other fibers on the same worker.
 Ordinary explicitly released writes already have their data/version publication;
 the hook supplies the ordering fence even when there are no staged buffers.
 On a commit failure the boundary returns failure and attempts to abort the current
@@ -154,29 +155,30 @@ completion hook. These are C++ runtime APIs; no new C ABI is introduced here.
   This fixed synchronization workload runs 24 rounds, independently of the
   execution-soak CL_PAR_ROUNDS settings. All 16 hosts must print PASS. The script
   initializes the configured shared region and therefore requires exclusive use.
-- Docker socket access is blocked in this session; actual 16-container/devdax
-  acceptance remains pending. Process tests do not establish physical non-coherent
-  visibility. Host crashes and transparent recovery remain outside this version.
+- The current file-backed 16-host process/container harness validates protocol
+  behavior. Physical non-coherent DAX/CXL visibility and performance remain
+  environment-dependent. Host crashes and transparent recovery remain outside
+  this version.
 
 ## Scheduling and resource control
 
-The runtime publishes a compact `LOAD_UPDATE` to every peer whenever local
-pending or running counts change. Automatic placement combines these snapshots
-with local atomic counters, filters hosts at configured limits, and selects the
-lowest `running + pending` score. A dominant GPtr preference is retained while
-its score is within `scheduler_slack_ratio` of the least-loaded eligible host;
-otherwise the least-loaded host is selected.
+The runtime publishes a compact versioned `LOAD_UPDATE` to every peer on
+create/completion events and periodically. Samples contain executing, ready,
+blocked and worker counts in addition to pending creates and queue depth.
+Automatic placement filters hosts at configured limits. The configured policy is
+memory-aware by default, or can be round-robin or least-loaded.
 
 `max_running_threads_per_host` and `max_pending_creates_per_host` are independent
 per-execution-host limits; zero means unlimited. Local creates fail before a
 request is emitted when the pending limit is reached. Remote hosts recheck their
 running limit on CREATE_REQ and return a failed completion when admission is
 denied. Snapshots are advisory and can be stale, so the target-side check is
-mandatory. No reservation protocol, fairness guarantee, migration or host
-failure handling is provided yet. Completed-but-unjoined home threads continue
-to count against the local running limit until join releases their slot.
+mandatory. Host failure handling, cancellation and dynamic barrier membership
+are not provided. Running capacity is released once execution completes, before completion becomes
+observable to join or detach. Completed-but-unjoined home records retain their
+result but no running slot; detached records are reclaimed automatically.
 
-The scheduler score is:
+The memory-aware scheduler score is:
 
 ```text
 score = aged_running + aged_pending
@@ -185,16 +187,16 @@ score = aged_running + aged_pending
       + locality_penalty
 ```
 
-Remote samples carry a monotonic sequence and timestamp. Running and pending
-counts decay exponentially with `scheduler_load_half_life_ms`, so an old sample
-does not permanently exclude a host after a burst. Queue depth is sampled from
-the host-pair ring. Unfinished launch history is penalized to prevent a hot
-creator from repeatedly selecting the same host, while
-`scheduler_remote_locality_penalty` models the cost of running away from the
-host preferred by a dominant GPtr. Explicit placement bypasses scoring but
-remains subject to target admission.
+Remote samples carry a monotonic sequence and a receiver-local timestamp.
+Detailed samples estimate CPU demand as `(executing + ready) / workers`;
+blocked Fibers remain active for admission but do not add CPU demand. A
+least-loaded policy uses that estimate and predicts launches not yet visible in
+remote telemetry. Round-robin advances over eligible hosts. The memory-aware
+policy adds queue, launch-history and current-version coherence terms. Working
+set locality is queried only by the memory-aware policy. Explicit placement
+bypasses scoring but remains subject to target admission.
 
-The current thread model is pinned: after CREATE_REQ is admitted, its native
+The current thread model is pinned: after CREATE_REQ is admitted, its fiber
 stack and invocation remain on that execution host until completion. A future
 migration protocol therefore requires an application safe point, serialized
 thread state, home-host ownership transfer, destination admission, and a

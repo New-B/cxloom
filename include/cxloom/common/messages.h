@@ -23,6 +23,7 @@ enum class MessageKind : std::uint16_t {
     kLoadUpdate,
     kMigrateReq,
     kMigrateAck,
+    kFunctionManifest,
 };
 
 struct MessageHeader {

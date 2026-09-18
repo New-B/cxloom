@@ -3,6 +3,7 @@
 #include "cxloom/common/tracing.h"
 #include <cstring>
 #include <chrono>
+#include <algorithm>
 
 namespace cxloom::loompar {
 namespace {
@@ -25,11 +26,12 @@ loommem::QueueEnvelope EncodeBarrier(MessageKind kind, HostId source, HostId des
     std::memcpy(message.payload.data(), &wire, sizeof(wire));
     return message;
 }
-struct LoadWire { std::uint32_t magic; std::uint16_t version; std::uint16_t reserved0; std::uint32_t running; std::uint32_t pending; std::uint32_t queued; std::uint32_t reserved; std::uint64_t sequence; std::uint64_t sampled_at_ns; };
+struct LoadWire { std::uint32_t magic; std::uint16_t version; std::uint16_t reserved0; std::uint32_t running; std::uint32_t pending; std::uint32_t queued; std::uint32_t reserved; std::uint64_t sequence; std::uint64_t sampled_at_ns; ExecutionLoad execution; };
+static_assert(sizeof(LoadWire) <= loommem::kQueuePayloadBytes);
 loommem::QueueEnvelope EncodeLoad(HostId source, HostId destination,
                                   std::uint32_t running, std::uint32_t pending,
-                                  std::uint32_t queued, std::uint64_t sequence, std::uint64_t sampled_at_ns) {
-    LoadWire wire{kWireMagic, kWireVersion, 0, running, pending, queued, 0, sequence, sampled_at_ns};
+                                  std::uint32_t queued, std::uint64_t sequence, std::uint64_t sampled_at_ns, ExecutionLoad execution) {
+    LoadWire wire{kWireMagic, 2, 0, running, pending, queued, 0, sequence, sampled_at_ns, execution};
     loommem::QueueEnvelope message;
     message.header = {MessageKind::kLoadUpdate, source, destination, sizeof(wire)};
     message.payload.resize(sizeof(wire));
@@ -44,6 +46,7 @@ LoomParRuntime::LoomParRuntime(CxloomConfig config, loommem::LoomMemRuntime* loo
       config_(std::move(config)),
       loommem_(loommem),
       thread_manager_(config_.local_host_id),
+      cluster_registry_(config_.local_host_id, config_.host_count),
       scheduler_(config_, loommem_),
       barrier_manager_(config_.local_host_id, config_.host_count,
           [this](MessageKind kind, HostId target, std::uint64_t id, std::uint64_t generation, bool failed) {
@@ -64,11 +67,12 @@ struct ThreadWire {
     std::uint64_t result_value;
     std::uint64_t migration_epoch;
 };
+static_assert(sizeof(ThreadWire) + kMaxClusterArgumentBytes == loommem::kQueuePayloadBytes);
 loommem::QueueEnvelope Encode(MessageKind kind, HostId source, HostId destination,
                               GlobalThreadId id, std::uint64_t function = 0,
                               std::int32_t code = 0, const std::vector<std::byte>& args = {},
-                              std::uint64_t result_value = 0, std::uint64_t migration_epoch = 0) {
-    ThreadWire wire{kWireMagic, kWireVersion, 0, id.local_tid, function, code, id.home_host, static_cast<std::uint16_t>(args.size()), result_value, migration_epoch};
+                              std::uint64_t result_value = 0, std::uint64_t migration_epoch = 0, bool cluster = false) {
+    ThreadWire wire{kWireMagic, kWireVersion, static_cast<std::uint16_t>(cluster), id.local_tid, function, code, id.home_host, static_cast<std::uint16_t>(args.size()), result_value, migration_epoch};
     loommem::QueueEnvelope message;
     message.header = {kind, source, destination, static_cast<std::uint32_t>(sizeof(wire) + args.size())};
     message.payload.resize(message.header.payload_bytes);
@@ -112,6 +116,7 @@ Status LoomParRuntime::Initialize() {
 Status LoomParRuntime::Finalize() {
     std::lock_guard<std::mutex> api_lock(api_mutex_);
     if (!initialized_) return Status::Ok();
+    if (active_manifest_calls_) return Status::FailedPrecondition("finish cluster registration/create calls before finalize");
     if (active_barriers_ || !barrier_manager_.idle() || loommem_->staged_write_count())
         return Status::FailedPrecondition("finish barriers and publish staged writes before finalize");
     // Give the progress thread a short quiescence window to flush load and
@@ -119,7 +124,15 @@ Status LoomParRuntime::Finalize() {
     const auto drain_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     for (;;) {
         bool empty = false;
-        { std::lock_guard<std::mutex> lock(control_mutex_); empty = outgoing_.empty(); }
+        {
+            std::lock_guard<std::mutex> lock(control_mutex_);
+            // Load samples are advisory. Peers may already be quiescent and
+            // have stopped consuming; only lifecycle/barrier traffic must drain.
+            outgoing_.erase(std::remove_if(outgoing_.begin(), outgoing_.end(), [](const auto& message) {
+                return message.header.kind == MessageKind::kLoadUpdate;
+            }), outgoing_.end());
+            empty = outgoing_.empty();
+        }
         if (empty) break;
         if (std::chrono::steady_clock::now() >= drain_deadline)
             return Status::FailedPrecondition("outgoing control messages did not drain before finalize");
@@ -127,6 +140,9 @@ Status LoomParRuntime::Finalize() {
     }
     {
         std::lock_guard<std::mutex> lock(control_mutex_);
+        outgoing_.erase(std::remove_if(outgoing_.begin(), outgoing_.end(), [](const auto& message) {
+            return message.header.kind == MessageKind::kLoadUpdate;
+        }), outgoing_.end());
         if (thread_manager_.size() || !remote_executions_.empty() || !outgoing_.empty())
             return Status::FailedPrecondition("join home threads and drain remote executions before finalize");
     }
@@ -138,6 +154,40 @@ Status LoomParRuntime::Finalize() {
     }
     initialized_ = false;
     return Status::Ok();
+}
+
+Status LoomParRuntime::RegisterClusterFunctions(std::vector<ClusterFunction> functions, std::uint64_t timeout_ms) {
+    if (!timeout_ms || timeout_ms > UINT32_MAX) return Status::InvalidArgument("invalid registration timeout");
+    {
+        std::lock_guard<std::mutex> lock(api_mutex_);
+        if (!initialized_) return Status::FailedPrecondition("initialize LoomPar before cluster registration");
+        auto messages = cluster_registry_.Install(std::move(functions));
+        if (!messages.ok()) return messages.status();
+        for (auto& message : messages.value()) Enqueue(std::move(message));
+        ++active_manifest_calls_;
+    }
+    struct Guard { std::atomic<std::size_t>& n; ~Guard() { --n; } } guard{active_manifest_calls_};
+    return cluster_registry_.Wait(timeout_ms);
+}
+
+Result<GlobalThreadId> LoomParRuntime::CreateRegisteredThread(std::uintptr_t identity, std::vector<std::byte> args, const ThreadPlacementHint& hint) {
+    Result<std::uint64_t> id = Status::NotFound("unregistered callback");
+    {
+        std::lock_guard<std::mutex> lock(api_mutex_);
+        if (!initialized_) return Status::FailedPrecondition("initialize LoomPar before create");
+        id = cluster_registry_.Lookup(identity);
+        if (!id.ok()) return id.status();
+        ++active_manifest_calls_;
+    }
+    struct Guard { std::atomic<std::size_t>& n; ~Guard() { --n; } } guard{active_manifest_calls_};
+    // A remote callback may start while its host is still finishing the local
+    // registration rendezvous. Its nested creates wait cooperatively here.
+    auto ready = cluster_registry_.Wait(config_.bootstrap_timeout_ms);
+    if (!ready.ok()) return ready;
+    std::lock_guard<std::mutex> lock(api_mutex_);
+    auto function = cluster_registry_.Resolve(id.value(), args.size(), true);
+    if (!function.ok()) return function.status();
+    return LaunchThread(id.value(), function.value(), std::move(args), hint, {}, true);
 }
 
 Result<std::uint64_t> LoomParRuntime::RegisterFunction(const std::string& name, ThreadFunction function) {
@@ -161,7 +211,17 @@ Result<GlobalThreadId> LoomParRuntime::CreateThread(const std::string& function_
         return function_id.status();
     }
 
-    auto target = scheduler_.SelectHost(hint, BuildLocalLoadView());
+    auto function = function_registry_.Resolve(function_id.value());
+    if (!function.ok()) return function.status();
+    return LaunchThread(function_id.value(), function.value(), std::move(arg_bytes), hint, std::move(result), false);
+}
+
+// api_mutex_ is held by the caller across admission and dispatch.
+Result<GlobalThreadId> LoomParRuntime::LaunchThread(std::uint64_t function_id, ThreadFunction function,
+                                                    std::vector<std::byte> arg_bytes,
+                                                    const ThreadPlacementHint& hint,
+                                                    std::function<std::uint64_t()> result, bool cluster) {
+    auto target = scheduler_.SelectHost(hint, BuildLocalLoadView(), false);
     if (!target.ok()) {
         return target.status();
     }
@@ -169,11 +229,15 @@ Result<GlobalThreadId> LoomParRuntime::CreateThread(const std::string& function_
     if (target.value() >= config_.host_count) return Status::InvalidArgument("execution host out of range");
     if (target.value() != config_.local_host_id && arg_bytes.size() > loommem::kQueuePayloadBytes - sizeof(ThreadWire))
         return Status::InvalidArgument("remote inline arguments exceed queue payload; pass a GPtr for larger data");
-    auto function = function_registry_.Resolve(function_id.value());
-    if (!function.ok()) return function.status();
     auto published = loommem_->SynchronizeRelease();
     if (!published.ok()) return published;
-    auto gtid = thread_manager_.AllocateThread(target.value(), function_id.value(), arg_bytes);
+    // Publication may change last-writer/replica freshness. Place using the
+    // state visible to the child after its acquire boundary.
+    target = scheduler_.SelectHost(hint, BuildLocalLoadView());
+    if (!target.ok()) return target.status();
+    if (target.value() != config_.local_host_id && arg_bytes.size() > loommem::kQueuePayloadBytes - sizeof(ThreadWire))
+        return Status::InvalidArgument("remote inline arguments exceed queue payload");
+    auto gtid = thread_manager_.AllocateThread(target.value(), function_id, arg_bytes);
     if (!gtid.ok()) return gtid.status();
     thread_manager_.MarkLaunching(gtid.value());
     if (target.value() == config_.local_host_id) {
@@ -184,9 +248,13 @@ Result<GlobalThreadId> LoomParRuntime::CreateThread(const std::string& function_
             return reserve;
         }
         scheduler_.RecordLaunch(target.value());
-        auto status = thread_manager_.Launch(gtid.value(), function.value(),
+        auto status = thread_manager_.Launch(gtid.value(), function,
             [this] { return loommem_->SynchronizeAcquire(); },
-            [this] { return loommem_->SynchronizeRelease(); }, std::move(result));
+            [this] { return loommem_->SynchronizeRelease(); }, std::move(result), {}, [this] {
+                ReleaseExecution(config_.local_host_id);
+                scheduler_.RecordCompletion(config_.local_host_id);
+                for (HostId host = 0; host < config_.host_count; ++host) PublishLoad(host);
+            });
         if (!status.ok()) { ReleaseExecution(target.value()); thread_manager_.Join(gtid.value()); return status; }
     } else {
         if (config_.max_pending_creates_per_host &&
@@ -197,29 +265,31 @@ Result<GlobalThreadId> LoomParRuntime::CreateThread(const std::string& function_
         scheduler_.RecordLaunch(target.value());
         for (HostId host = 0; host < config_.host_count; ++host) PublishLoad(host);
         Enqueue(Encode(MessageKind::kCreateReq, config_.local_host_id, target.value(),
-                       gtid.value(), function_id.value(), 0, arg_bytes));
+                       gtid.value(), function_id, 0, arg_bytes, 0, 0, cluster));
     }
     return gtid.value();
 }
 
-Status LoomParRuntime::JoinThread(const GlobalThreadId& gtid) {
-    if (!initialized_) {
-        return Status::FailedPrecondition("LoomPar runtime must be initialized before join");
-    }
+Status LoomParRuntime::JoinThread(const GlobalThreadId& gtid, std::uint64_t* result) {
+    if (!initialized_) return Status::FailedPrecondition("initialize LoomPar before join");
+    return thread_manager_.Join(gtid, [this] { return loommem_->SynchronizeAcquire(); }, result);
+}
 
-    auto record = thread_manager_.Find(gtid);
-    if (!record.ok()) return record.status();
-    auto status = thread_manager_.Join(gtid, [this] { return loommem_->SynchronizeAcquire(); });
-    if (record.value().execution_host == config_.local_host_id) {
-        ReleaseExecution(config_.local_host_id);
-        scheduler_.RecordCompletion(config_.local_host_id);
-        for (HostId host = 0; host < config_.host_count; ++host) PublishLoad(host);
-    }
-    return status;
+Status LoomParRuntime::DetachThread(const GlobalThreadId& gtid) {
+    std::lock_guard<std::mutex> lock(api_mutex_);
+    if (!initialized_) return Status::FailedPrecondition("initialize LoomPar before detach");
+    return thread_manager_.Detach(gtid);
 }
 
 void LoomParRuntime::Enqueue(loommem::QueueEnvelope message) {
     std::lock_guard<std::mutex> lock(control_mutex_);
+    if (message.header.kind == MessageKind::kLoadUpdate) {
+        for (auto& pending : outgoing_)
+            if (pending.header.kind == MessageKind::kLoadUpdate && pending.header.dst_host == message.header.dst_host) {
+                pending = std::move(message);
+                return;
+            }
+    }
     outgoing_.push_back(std::move(message));
 }
 
@@ -247,11 +317,12 @@ Status LoomParRuntime::PublishLoad(HostId destination) {
     Enqueue(EncodeLoad(config_.local_host_id, destination,
                        local_running_.load(std::memory_order_acquire),
                        local_pending_.load(std::memory_order_acquire), queued,
-                       load_sequence_.fetch_add(1, std::memory_order_acq_rel) + 1, now));
+                       load_sequence_.fetch_add(1, std::memory_order_acq_rel) + 1, now, SampleExecutionLoad()));
     return Status::Ok();
 }
 
 Status LoomParRuntime::HandleMessage(loommem::QueueEnvelope message) {
+    if (message.header.kind == MessageKind::kFunctionManifest) return cluster_registry_.Handle(message);
     if (message.header.kind == MessageKind::kMigrateReq) {
         if (message.header.dst_host != config_.local_host_id || message.payload.size() != sizeof(MigrationRequest))
             return Status::InvalidArgument("invalid migration request");
@@ -284,13 +355,15 @@ Status LoomParRuntime::HandleMessage(loommem::QueueEnvelope message) {
             message.header.src_host >= config_.host_count) return Status::InvalidArgument("invalid load update");
         LoadWire wire{};
         std::memcpy(&wire, message.payload.data(), sizeof(wire));
-        if (wire.magic != kWireMagic || wire.version != kWireVersion)
+        if (wire.magic != kWireMagic || wire.version != 2)
             return Status::InvalidArgument("unsupported load-update protocol version");
         std::lock_guard<std::mutex> lock(load_mutex_);
         auto& sample = remote_load_[message.header.src_host];
         if (wire.sequence >= sample.sample_sequence)
             sample = HostLoadSnapshot{message.header.src_host, wire.running, wire.pending,
-                                      wire.queued, wire.sequence, wire.sampled_at_ns};
+                                      wire.queued, wire.sequence, static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count()), wire.execution};
         return Status::Ok();
     }
     if (message.header.kind == MessageKind::kBarrierArrive || message.header.kind == MessageKind::kBarrierRelease) {
@@ -311,7 +384,8 @@ Status LoomParRuntime::HandleMessage(loommem::QueueEnvelope message) {
     std::memcpy(&wire, message.payload.data(), sizeof(wire));
     if (wire.magic != kWireMagic || wire.version != kWireVersion)
         return Status::InvalidArgument("unsupported thread protocol version");
-    if (message.payload.size() != sizeof(wire) + wire.argument_bytes)
+    if (wire.reserved > 1 || message.header.payload_bytes != message.payload.size() ||
+        message.payload.size() != sizeof(wire) + wire.argument_bytes)
         return Status::InvalidArgument("invalid thread argument length");
     GlobalThreadId id{wire.home, wire.tid};
     if (message.header.kind == MessageKind::kCreateReq) {
@@ -321,7 +395,9 @@ Status LoomParRuntime::HandleMessage(loommem::QueueEnvelope message) {
             for (const auto& existing : remote_executions_)
                 if (existing.home == id) return Status::Ok();
         }
-        auto function = function_registry_.Resolve(wire.function);
+        auto function = wire.reserved == 1
+            ? cluster_registry_.Resolve(wire.function, wire.argument_bytes, false)
+            : function_registry_.Resolve(wire.function);
         if (!function.ok()) {
             Enqueue(Encode(MessageKind::kCompleteNotify, config_.local_host_id, id.home_host, id, 0, -1));
             return Status::Ok();
@@ -343,7 +419,6 @@ Status LoomParRuntime::HandleMessage(loommem::QueueEnvelope message) {
             remote_executions_.push_back({id, local.value()});
             if (status.ok()) outgoing_.push_back(Encode(MessageKind::kCreateAck, config_.local_host_id, id.home_host, id));
         }
-        if (!status.ok()) ReleaseExecution(config_.local_host_id);
         return Status::Ok();
     }
     auto record = thread_manager_.Find(id);
@@ -354,14 +429,15 @@ Status LoomParRuntime::HandleMessage(loommem::QueueEnvelope message) {
         if (message.header.kind == MessageKind::kCompleteNotify &&
             record.value().migration_epoch != wire.migration_epoch)
             return Status::Ok();
-        auto status = message.header.kind == MessageKind::kCreateAck
-            ? thread_manager_.MarkRunning(id) : thread_manager_.MarkCompleted(id, wire.code, wire.result_value);
+        if (record.value().state == ThreadState::kCompleted) return Status::Ok();
         if (message.header.kind == MessageKind::kCompleteNotify) {
             local_pending_.fetch_sub(1, std::memory_order_acq_rel);
             scheduler_.RecordCompletion(message.header.src_host);
         }
         if (message.header.kind == MessageKind::kCompleteNotify)
             for (HostId host = 0; host < config_.host_count; ++host) PublishLoad(host);
+        auto status = message.header.kind == MessageKind::kCreateAck
+            ? thread_manager_.MarkRunning(id) : thread_manager_.MarkCompleted(id, wire.code, wire.result_value);
         // Join may reclaim the record between the snapshot and this transition.
         return status.code() == StatusCode::kNotFound ? Status::Ok() : status;
     }
@@ -369,6 +445,7 @@ Status LoomParRuntime::HandleMessage(loommem::QueueEnvelope message) {
 }
 
 void LoomParRuntime::Progress() {
+    auto next_load_update = std::chrono::steady_clock::now();
     while (!stopping_) {
         bool load_changed = false;
         {
@@ -395,7 +472,11 @@ void LoomParRuntime::Progress() {
                 if (!status.ok()) outgoing_.push_back(std::move(message));
             }
         }
-        if (load_changed) {
+        if (load_changed || std::chrono::steady_clock::now() >= next_load_update) {
+            // Periodic samples capture runnable/blocked transitions that do not
+            // otherwise generate lifecycle traffic. Keep the rate low enough
+            // that all-to-all telemetry cannot starve create/completion queues.
+            next_load_update = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
             for (HostId host = 0; host < config_.host_count; ++host) PublishLoad(host);
         }
         std::this_thread::sleep_for(std::chrono::microseconds(50));
@@ -422,13 +503,23 @@ Status LoomParRuntime::Barrier(std::uint64_t barrier_id, std::size_t local_parti
     return status;
 }
 
+ExecutionLoad LoomParRuntime::SampleExecutionLoad() const {
+    auto load = thread_manager_.SampleExecutionLoad();
+    const auto remote = executions_.SampleExecutionLoad();
+    load.executing += remote.executing;
+    load.ready += remote.ready;
+    load.blocked += remote.blocked;
+    load.workers += remote.workers;
+    return load;
+}
+
 std::vector<HostLoadSnapshot> LoomParRuntime::BuildLocalLoadView() const {
     std::vector<HostLoadSnapshot> view;
     view.reserve(config_.host_count);
     std::lock_guard<std::mutex> lock(load_mutex_);
     for (HostId host = 0; host < config_.host_count; ++host)
         view.push_back(host == config_.local_host_id
-            ? HostLoadSnapshot{host, local_running_.load(), local_pending_.load(), 0, load_sequence_.load(), 0}
+            ? HostLoadSnapshot{host, local_running_.load(), local_pending_.load(), 0, load_sequence_.load(), 0, SampleExecutionLoad()}
             : remote_load_.at(host));
     return view;
 }

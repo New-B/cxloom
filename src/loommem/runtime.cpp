@@ -1,3 +1,4 @@
+#include "cxloom/common/execution_context.h"
 #include "cxloom/loommem/runtime.h"
 
 #include <algorithm>
@@ -515,8 +516,55 @@ std::uint64_t LoomMemRuntime::visibility_error_count() const {
     return errors;
 }
 
+Result<std::vector<BlockLocality>> LoomMemRuntime::QueryLocality(const WorkingSetEntry& entry) const {
+    if (!initialized_) return Status::FailedPrecondition("locality requires initialized LoomMem");
+    auto reference = allocator_->AcquireReference(entry.object, config_.local_host_id);
+    if (!reference.ok()) return reference.status();
+    auto* descriptor = reference.value();
+    auto guard = std::shared_ptr<void>(descriptor, [this](void* p) {
+        allocator_->ReleaseReference(static_cast<AllocationDescriptor*>(p), config_.local_host_id);
+    });
+    if (entry.offset >= descriptor->bytes || entry.bytes > descriptor->bytes - entry.offset)
+        return Status::InvalidArgument("working set range outside allocation");
+    const auto bytes = entry.bytes ? entry.bytes : descriptor->bytes - entry.offset;
+    const auto granule = descriptor->coherence_block_bytes;
+    std::vector<BlockLocality> result;
+    for (auto i = entry.offset / granule; i <= (entry.offset + bytes - 1) / granule; ++i) {
+        auto found = allocator_->MutableCoherenceBlock(entry.object, i, true);
+        if (!found.ok()) return found.status();
+        auto* block = found.value();
+        bool sampled = false;
+        for (unsigned retry = 0; retry < 32; ++retry) {
+            const auto epoch = block->writeback_epoch.load(std::memory_order_acquire);
+            if (epoch & 1) continue;
+            BlockLocality sample{};
+            sample.bytes = std::min(entry.offset + bytes, (i + 1) * granule) - std::max(entry.offset, i * granule);
+            sample.version = block->version.load(std::memory_order_acquire);
+            sample.token_owner = block->token_owner.load(std::memory_order_acquire);
+            sample.last_writer = block->last_writer.load(std::memory_order_acquire);
+            for (HostId host = 0; host < config_.host_count; ++host)
+                if (block->replica_versions[host].load(std::memory_order_acquire) == sample.version + 1)
+                    sample.current_replica_hosts |= 1ULL << host;
+            if (epoch != block->writeback_epoch.load(std::memory_order_acquire)) continue;
+            result.push_back(sample);
+            sampled = true;
+            break;
+        }
+        if (!sampled) return Status::Unavailable("locality changed during writeback; retry create");
+    }
+    return result;
+}
+
 Result<HostId> LoomMemRuntime::ResolvePreferredHost(const GlobalPointer& gptr) const {
-    return ResolveOwningHost(gptr);
+    auto blocks = QueryLocality(WorkingSetEntry{gptr});
+    if (!blocks.ok()) return blocks.status();
+    std::array<std::uint64_t, kMaxHosts> owned_bytes{};
+    for (const auto& block : blocks.value()) {
+        if (block.token_owner >= config_.host_count)
+            return Status::FailedPrecondition("invalid coherence token owner");
+        owned_bytes[block.token_owner] += block.bytes;
+    }
+    return static_cast<HostId>(std::max_element(owned_bytes.begin(), owned_bytes.end()) - owned_bytes.begin());
 }
 
 Result<SpscQueue*> LoomMemRuntime::GetQueue(HostId producer, HostId consumer) {
@@ -652,6 +700,9 @@ std::shared_ptr<std::mutex> LoomMemRuntime::LocalObjectMutex(std::uint64_t offse
 
 void LoomMemRuntime::EraseReplicaLocked(ReplicaIndex& index, ReplicaIndex::iterator entry) {
     auto object = cached_objects_.find(entry->second.object_offset);
+    auto block = allocator_->MutableCoherenceBlock(
+        object->second.info.gptr, entry->second.block_index, true);
+    if (block.ok()) block.value()->replica_versions[config_.local_host_id].store(0, std::memory_order_release);
     cached_replica_bytes_ -= entry->second.storage->size();
     index.erase(entry);
     if (--object->second.blocks == 0) {
@@ -720,6 +771,8 @@ void LoomMemRuntime::CacheReplicaLocked(std::uint64_t cache_key, const Allocatio
     cached_replica_bytes_ += storage->size();
     replicas_.emplace(cache_key, CachedReplica {info.gptr.offset, block_index, version,
                                                 std::move(storage), ++replica_access_clock_});
+    auto block = allocator_->MutableCoherenceBlock(info.gptr, block_index, true);
+    if (block.ok()) block.value()->replica_versions[config_.local_host_id].store(version + 1, std::memory_order_release);
     EvictReplicasLocked();
 }
 
@@ -985,7 +1038,7 @@ Status LoomMemRuntime::StageWriteBuffer(WriteBuffer* write) {
     if (write->storage.use_count() != 1 || write->reference_guard.use_count() != 1)
         return Status::FailedPrecondition("staging requires exclusive write buffer ownership");
     std::lock_guard<std::mutex> lock(staged_mutex_);
-    staged_writes_[std::this_thread::get_id()].push_back(std::move(*write));
+    staged_writes_[CurrentExecutionContextId()].push_back(std::move(*write));
     *write = WriteBuffer{};
     return Status::Ok();
 }
@@ -1002,7 +1055,7 @@ Status LoomMemRuntime::SynchronizeRelease() {
     std::vector<WriteBuffer> writes;
     {
         std::lock_guard<std::mutex> lock(staged_mutex_);
-        auto it = staged_writes_.find(std::this_thread::get_id());
+        auto it = staged_writes_.find(CurrentExecutionContextId());
         if (it != staged_writes_.end()) {
             writes = std::move(it->second);
             staged_writes_.erase(it);

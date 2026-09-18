@@ -16,7 +16,7 @@ public:
     PlacementScheduler(CxloomConfig config, const loommem::LoomMemRuntime* loommem);
 
     Result<HostId> SelectHost(const ThreadPlacementHint& hint,
-                              const std::vector<HostLoadSnapshot>& load_view);
+                              const std::vector<HostLoadSnapshot>& load_view, bool advance = true);
     void RecordLaunch(HostId host);
     void RecordCompletion(HostId host);
     std::uint64_t launch_count(HostId host) const;
@@ -25,7 +25,7 @@ private:
     CxloomConfig config_;
     const loommem::LoomMemRuntime* loommem_ {nullptr};
     std::uint64_t rr_cursor_ {0};
-    HostId last_selected_ {0};
+    mutable std::mutex selection_mutex_;
     mutable std::mutex history_mutex_;
     std::unordered_map<HostId, std::uint64_t> launches_;
     std::unordered_map<HostId, std::uint64_t> completions_;

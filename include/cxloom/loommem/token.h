@@ -1,4 +1,5 @@
 #pragma once
+#include "cxloom/common/condition.h"
 
 #include <atomic>
 #include <array>
@@ -72,7 +73,7 @@ class TokenService {
         bool retain_completion {false};
         TokenLease lease {};
         Status completion_status {};
-        std::condition_variable ready;
+        CooperativeCondition ready;
     };
     struct LocalObject {
         bool available {false};

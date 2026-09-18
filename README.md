@@ -32,7 +32,22 @@ cmake --build build
 
 ## Current Status
 
-LoomPar now supports native local threads, blocking join and remote create/completion over the shared CXL queues. The remote lifecycle has been validated with 16 independent file-backed host processes; container/devdax validation remains pending. A generation-aware blocking world barrier and explicit LoomMem release/acquire hooks are implemented; expanded cross-node scheduling remains next. See [the execution milestone](docs/loompar-execution-milestone.md) for API contracts, validation and current limits, and [the synchronization contract](docs/loompar-synchronization.md) for staged writes and barrier participation.
+The current Debug build passes 38 CTest tests. LoomPar supports cluster
+function registration, local and remote create/join/detach with return values,
+pinned Fiber execution, cooperative waits, barriers, distributed mutexes and
+conditions, and LoomMem release/acquire boundaries. Placement supports the
+default memory-aware policy plus round-robin and least-loaded policies, with
+execution telemetry for executing, ready and blocked Fibers. Working-set read /
+write information is an application hint used only by memory-aware placement.
+
+The 16-host file-backed process and container harnesses validate protocol
+behavior and lifecycle reclamation. They do not establish physical non-coherent
+CXL/DAX visibility or performance. Remaining work is host failure recovery,
+cancellation/deadlines, dynamic barrier membership, arbitrary blocking-call
+isolation, physical CXL acceptance, and performance/application evaluation. See
+[the execution contract](docs/loompar-execution-milestone.md), [the design and
+remaining gaps](docs/cxloom-design-understanding.md), and [the synchronization
+contract](docs/loompar-synchronization.md).
 
 ## C API
 
@@ -203,3 +218,10 @@ Run scripts/run-visibility-litmus-containers.sh after container launch to
 compare release, sequentially consistent, CLFLUSH+MFENCE, and CLWB+SFENCE publication/acquisition recipes. See docs/visibility-ordering-litmus.md for the protocol and
 interpretation rules. Only real /dev/dax0.0 results should determine the
 runtime's eventual publication recipe.
+
+Multi-host C API applications now register a collective function manifest with
+`cl_pthread_register_functions` before creating threads. Names, declared ABI/schema
+and argument sizes are checked across hosts; private callbacks resolve through
+stable IDs without exporting symbols. See [the API contract](docs/loompar-user-api.md#cluster-function-registration)
+and `cxloom_loompar_cluster_process` for automatic remote placement, return values,
+nested create/join and detached invocation reclamation.

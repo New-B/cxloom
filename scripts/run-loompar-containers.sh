@@ -4,10 +4,16 @@ set -euo pipefail
 # Run exclusively: host 0 formats the configured shared region.
 log_dir="$(mktemp -d /tmp/cxloom-loompar-containers.XXXXXX)"
 pids=()
+region_env=()
+# Optional isolated file-backed container verification. The file must exist at
+# this same container-visible path in every participant's shared bind mount.
+if [[ -n "${CL_PAR_BACKING_FILE:-}" ]]; then
+    region_env=(--env "CL_DAX_DEVICE=${CL_PAR_BACKING_FILE}" --env CL_CREATE_REGION_FILE=1)
+fi
 program="${CL_PAR_PROGRAM:-cxloom_loompar_threads}"
 case "$program" in
-    cxloom_loompar_threads|cxloom_loompar_sync) ;;
-    *) echo "CL_PAR_PROGRAM must select cxloom_loompar_threads or cxloom_loompar_sync" >&2; exit 2 ;;
+    cxloom_loompar_threads|cxloom_loompar_sync|cxloom_loompar_cluster_process) ;;
+    *) echo "CL_PAR_PROGRAM must select cxloom_loompar_threads, cxloom_loompar_sync or cxloom_loompar_cluster_process" >&2; exit 2 ;;
 esac
 rounds="${CL_PAR_ROUNDS:-300}"
 creators="${CL_PAR_CREATORS:-4}"
@@ -30,7 +36,7 @@ for ((host = 0; host < 16; ++host)); do
     ' >"${log_dir}/build-${host}.log" 2>&1 || { cat "${log_dir}/build-${host}.log"; exit 1; }
 done
 start_host() {
-    docker exec --env "CL_HOST_ID=$1" --env CL_HOST_COUNT=16 \
+    docker exec "${region_env[@]}" --env "CL_HOST_ID=$1" --env CL_HOST_COUNT=16 \
         --env "CL_PAR_ROUNDS=${rounds}" --env "CL_PAR_CREATORS=${creators}" \
         --env "CL_PAR_ROUND_DELAY_MS=${delay_ms}" "cxloom-h$1" \
         timeout "$run_timeout" "/tmp/cxloom-build/${program}" >"${log_dir}/host-$1.log" 2>&1 &

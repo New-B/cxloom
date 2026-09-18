@@ -5,7 +5,10 @@ This roadmap assumes we keep the current two-subsystem split:
 - `LoomMem`: shared-memory substrate
 - `LoomPar`: distributed thread runtime
 
-The order below is intentionally bottom-up. Higher layers should not be implemented before the visibility and control assumptions underneath them are validated.
+Phases 0–7 describe the completed foundation. Phase 8 is the current
+co-design implementation and Phase 9 contains the remaining measurement and
+hardening work. Physical CXL acceptance is tracked separately from the
+file-backed development platform.
 
 ## Phase 0: Platform Bring-Up
 
@@ -87,7 +90,8 @@ Current status:
 - separated producer tail and consumer head into single-writer cache lines
 - added fixed slots, sequence validation, backpressure, endpoint checks, and visibility-profile integration
 - added a CPU-bound round-robin poller with batch drain, adaptive backoff, dispatch callbacks, and runtime lifecycle management
-- validated dynamically sized all-pairs queues on `/dev/dax0.0`
+- validated dynamically sized all-pairs queues with shared file mappings and
+  container/process harnesses; physical DAX access is environment-dependent
 
 ## Phase 4: LoomMem Allocator and Global Addressing
 
@@ -193,6 +197,10 @@ Exit criteria:
 - remote create and completion work over CXL queues
 - lifecycle authority remains at the home host
 
+Status: complete. Cluster function manifests, remote argument validation,
+result-bearing join, detach reclamation, nested create/join and 16-host
+cross-process/container harnesses are implemented.
+
 ## Phase 7: Join and Barrier
 
 Goal:
@@ -211,6 +219,11 @@ Exit criteria:
 - create/join/barrier form a coherent runtime contract
 - LoomPar synchronization composes correctly with LoomMem consistency
 
+Status: complete for the fixed-world contract. Join, reusable generation
+barriers, distributed mutex/condition handles, cooperative Fiber waits and
+release/acquire hooks are implemented. Dynamic membership and missing-host
+recovery remain outside this version.
+
 ## Phase 8: Placement and Memory-Execution Co-Design
 
 Goal:
@@ -219,16 +232,21 @@ Goal:
 
 Tasks:
 
-1. start with round-robin and least-loaded baselines
-2. add dominant-object placement hints
-3. expose token owner, last writer, and replica residency from LoomMem
-4. define a placement cost model using load plus coherence cost
-5. compare `move thread` versus `move token/data`
+1. implement round-robin and least-loaded baselines
+2. add dominant-object and declared working-set hints
+3. expose token owner, last writer, and current-version replica residency
+4. combine execution load with the existing deterministic coherence heuristic
+5. validate placement through remote lifecycle and load telemetry tests
 
 Exit criteria:
 
 - LoomPar placement uses actual memory/coherence signals
 - the system begins to realize the main CXLoom research idea
+
+Status: complete for the current scope. The scheduler now supports memory-aware,
+round-robin and least-loaded policies, and execution telemetry distinguishes
+executing, ready and blocked Fibers. Replica heat tracking and a measured or
+learned access-cost model are intentionally deferred.
 
 ## Phase 9: Benchmarks and Hardening
 
@@ -249,20 +267,13 @@ Exit criteria:
 - the system is stable enough for larger experiments
 - each subsystem has clear performance and correctness evidence
 
-## Recommended Coding Order Inside the Current Skeleton
+## Current Next Steps
 
-If we use the current repository skeleton, the best next implementation order is:
-
-1. `src/loommem/runtime.cpp`
-2. `src/loommem/queue.cpp`
-3. `src/loommem/allocator.cpp`
-4. `src/loommem/coherence.cpp`
-5. `src/loompar/threading.cpp`
-6. `src/loompar/runtime.cpp`
-7. `src/loompar/barrier.cpp`
-8. `src/loompar/scheduler.cpp`
-
-That order keeps the control plane from getting ahead of the data-plane guarantees it depends on.
+The next work is Phase 9 hardening rather than implementing the original
+bottom-up skeleton again: failure injection and host failure handling,
+cancellation/deadline propagation, physical CXL/DAX acceptance, application
+benchmarks, queue/token/create latency counters, and coherence-granularity
+measurements. Live-stack migration is not required by the pinned V1 contract.
 
 ## Current Shared Allocator V1 Boundary
 
@@ -278,13 +289,11 @@ release/acquire publication recipe. Physical non-coherent multi-host validation
 is deferred until hardware is available; host-failure recovery remains future
 work.
 
-## Active Development Baseline (2026-09-05)
+## Development Baseline
 
-The LoomMem regression at revision
-`2e3e1eba2a05c978e77420b5b42021508324d1b0` passed all 12 CTest tests,
-16-container DAX initialization, queue, token and coherence tests, and all four
-visibility recipes at 100,000 iterations each. See
-[the baseline report](loommem-baseline-20260905.md) for evidence and scope.
+The current Debug build passes 38 CTest tests, including LoomMem, C API,
+coherence, Fiber, LoomPar lifecycle, synchronization, locality and load tests,
+plus 16-host remote lifecycle tests for all three placement policies.
 
 The available platform is one multi-NUMA server with containers representing
 logical hosts. The user explicitly agreed to defer physical non-coherent
@@ -292,18 +301,14 @@ multi-host validation until that hardware is available. This does not block
 Phase 6 on the validated emulation platform, and does not establish correctness
 on physical non-coherent hardware.
 
-The next implementation milestone is LoomPar lifecycle control: real local
-thread execution and blocking join, followed by two-host remote create and
-completion with home-owned lifecycle state. Synchronization must compose with
-LoomMem publication before advancing to distributed barriers and placement.
+The shared file-backed platform validates protocol behavior. It does not claim
+physical non-coherent CXL visibility or performance.
 
-## Phase 8 update (2026-09-06)
+## Current verification note (2026-09-18)
 
-The Phase 6/7 implementation now has local and 16-process regression coverage.
-Phase 8 includes weighted placement and a reproducible policy simulation;
-see [the evaluation report](phase8-evaluation-20260906.md). Full CTest: 22/22 passed.
-A tested home migration transaction model defines commit/rollback and epoch
-validation, but runtime transport and serializable continuation integration
-remain open. The attempted 16-container DAX acceptance stopped at Docker socket
-permission denial before launching any workload. Earlier "next milestone" text
-above describes the September 5 baseline, not the current implementation frontier.
+The detailed implementation and remaining-gap list is maintained in
+[the LoomPar design note](cxloom-design-understanding.md) and
+[the memory-aware placement note](loompar-memory-aware-placement.md). The
+historical simulation and environment blockers in
+`phase8-evaluation-20260906.md` remain historical records and are not the
+current implementation status.

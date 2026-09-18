@@ -12,6 +12,7 @@
 #include <unordered_map>
 
 #include "cxloom/common/config.h"
+#include "cxloom/common/execution_context.h"
 #include "cxloom/common/tracing.h"
 #include "cxloom/loommem/runtime.h"
 #include "cxloom/loompar/runtime.h"
@@ -22,28 +23,35 @@ struct cl_runtime {
     cxloom::CxloomConfig config;
     cxloom::loommem::LoomMemRuntime loommem;
     std::unique_ptr<cxloom::loompar::LoomParRuntime> loompar;
-    std::mutex result_mutex;
-    std::unordered_map<std::uint64_t, std::shared_ptr<void*>> results;
+    std::mutex par_mutex;
 };
+
+constexpr std::uint64_t kMutexMagic = 0x434c4d5554455831ULL;
+constexpr std::uint64_t kConditionMagic = 0x434c434f4e443031ULL;
 
 struct ClMutex {
     cl_runtime_t* runtime{nullptr};
     cxloom::GlobalPointer object{};
     bool distributed{false};
-    std::mutex value;
+    bool owns_object{true};
+    cxloom::loommem::ObjectReference reference;
+    std::mutex guard;
+    cxloom::loompar::Condition available;
+    bool locked{false};
+    std::uint64_t owner{0};
+    std::size_t waiters{0};
     std::unique_ptr<cxloom::loommem::WriteBuffer> lease;
 };
 struct ClCond {
     cl_runtime_t* runtime{nullptr};
     cxloom::GlobalPointer object{};
     bool distributed{false};
-    std::condition_variable value;
-    std::atomic<std::uint32_t> waiters{0};
+    bool owns_object{true};
+    cxloom::loommem::ObjectReference reference;
+    std::mutex guard;
+    cxloom::loompar::Condition value;
+    std::size_t waiters{0};
 };
-
-static std::uint64_t ThreadKey(cl_pthread_t thread) {
-    return (static_cast<std::uint64_t>(thread.home_host) << 48) ^ thread.local_tid;
-}
 
 namespace {
 
@@ -63,6 +71,7 @@ cxloom::CxloomConfig ToCppConfig(const cl_config_t& config) {
     }
     result.bootstrap_owner = config.bootstrap_owner != 0;
     result.create_region_file = config.create_region_file != 0;
+    result.placement_policy = static_cast<cxloom::PlacementPolicy>(config.placement_policy);
     if (config.bootstrap_timeout_ms != 0) {
         result.bootstrap_timeout_ms = config.bootstrap_timeout_ms;
     }
@@ -114,6 +123,7 @@ extern "C" cl_status_t cl_runtime_finalize(cl_runtime_t* runtime) {
 namespace {
 cl_status_t EnsurePar(cl_runtime_t* runtime) {
     if (runtime == nullptr) return CL_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> lock(runtime->par_mutex);
     if (!runtime->loompar) {
         runtime->loompar = std::make_unique<cxloom::loompar::LoomParRuntime>(runtime->config, &runtime->loommem);
         const auto status = runtime->loompar->Initialize();
@@ -130,56 +140,86 @@ std::string CallbackName(cl_pthread_start_routine function) {
 }
 }
 
+extern "C" cl_status_t cl_pthread_register_functions(cl_runtime_t* runtime,
+                                                        const cl_pthread_function_t* functions,
+                                                        size_t count, uint64_t timeout_ms) {
+    if (!runtime || (count && !functions) || count > cxloom::loompar::kMaxClusterFunctions ||
+        !timeout_ms || timeout_ms > UINT32_MAX) return CL_INVALID_ARGUMENT;
+    std::vector<cxloom::loompar::ClusterFunction> manifest;
+    for (size_t i = 0; i < count; ++i) {
+        const auto& entry = functions[i];
+        if (!entry.name || !entry.start_routine) return CL_INVALID_ARGUMENT;
+        const auto name_bytes = strnlen(entry.name, cxloom::loompar::kMaxClusterFunctionName + 1);
+        if (!name_bytes || name_bytes > cxloom::loompar::kMaxClusterFunctionName) return CL_INVALID_ARGUMENT;
+        const auto callback = entry.start_routine;
+        manifest.push_back({std::string(entry.name, name_bytes), entry.abi_version, entry.argument_bytes,
+                            entry.schema_id, reinterpret_cast<std::uintptr_t>(callback),
+                            [callback](void* bytes) {
+                                cxloom::loompar::ThreadManager::SetCurrentResult(static_cast<std::uint64_t>(
+                                    reinterpret_cast<std::uintptr_t>(callback(bytes))));
+                            }});
+    }
+    auto status = EnsurePar(runtime);
+    if (status != CL_OK) return status;
+    return ToCStatus(runtime->loompar->RegisterClusterFunctions(std::move(manifest), timeout_ms));
+}
+
 extern "C" cl_status_t cl_pthread_create(cl_runtime_t* runtime, cl_pthread_t* thread,
-                                           cl_pthread_start_routine start_routine,
-                                           const void* arg, size_t arg_bytes) {
+    cl_pthread_start_routine start_routine, const void* arg, size_t arg_bytes) {
+    return cl_pthread_create_with_working_set(runtime, thread, start_routine, arg, arg_bytes, nullptr, 0);
+}
+extern "C" cl_status_t cl_pthread_create_with_working_set(cl_runtime_t* runtime, cl_pthread_t* thread,
+    cl_pthread_start_routine start_routine, const void* arg, size_t arg_bytes,
+    const cl_working_set_entry_t* working_set, size_t count) {
     if (runtime == nullptr || thread == nullptr || start_routine == nullptr || (arg_bytes && arg == nullptr))
         return CL_INVALID_ARGUMENT;
     if (arg_bytes > 104) return CL_INVALID_ARGUMENT;
+    if (count > 256 || (count && !working_set)) return CL_INVALID_ARGUMENT;
+    cxloom::ThreadPlacementHint hint;
+    for (size_t i = 0; i < count; ++i) {
+        const auto& entry = working_set[i];
+        hint.working_set.push_back({{entry.object.region_id, entry.object.offset}, entry.offset, entry.bytes,
+            static_cast<cxloom::MemoryAccess>(entry.access), entry.weight});
+    }
     auto status = EnsurePar(runtime);
     if (status != CL_OK) return status;
-    const auto name = CallbackName(start_routine);
-    auto result = std::make_shared<void*>(nullptr);
-    auto registration = runtime->loompar->RegisterFunction(name, [start_routine, result](void* bytes) {
-        *result = start_routine(bytes);
-    });
-    if (!registration.ok()) return ToCStatus(registration.status());
     std::vector<std::byte> bytes(arg_bytes);
     if (arg_bytes) std::memcpy(bytes.data(), arg, arg_bytes);
-    auto created = runtime->loompar->CreateThread(name, std::move(bytes), {},
-                                                   [result] { return static_cast<std::uint64_t>(
-                                                       reinterpret_cast<std::uintptr_t>(*result)); });
+    cxloom::Result<cxloom::GlobalThreadId> created = cxloom::Status::NotFound("unregistered callback");
+    if (runtime->config.host_count > 1 || runtime->loompar->has_cluster_manifest()) {
+        created = runtime->loompar->CreateRegisteredThread(reinterpret_cast<std::uintptr_t>(start_routine), std::move(bytes), hint);
+    } else {
+        // Backwards-compatible single-host calls need no manifest or symbol export.
+        const auto name = CallbackName(start_routine);
+        auto registration = runtime->loompar->RegisterFunction(name, [start_routine](void* data) {
+            cxloom::loompar::ThreadManager::SetCurrentResult(static_cast<std::uint64_t>(
+                reinterpret_cast<std::uintptr_t>(start_routine(data))));
+        });
+        if (!registration.ok()) return ToCStatus(registration.status());
+        created = runtime->loompar->CreateThread(name, std::move(bytes), hint);
+    }
     if (!created.ok()) return ToCStatus(created.status());
     thread->home_host = created.value().home_host;
     thread->local_tid = created.value().local_tid;
-    { std::lock_guard<std::mutex> lock(runtime->result_mutex); runtime->results[ThreadKey(*thread)] = result; }
     return CL_OK;
 }
 
 extern "C" cl_status_t cl_pthread_join(cl_runtime_t* runtime, cl_pthread_t thread, void** retval) {
     if (runtime == nullptr || runtime->loompar == nullptr) return CL_INVALID_ARGUMENT;
-    auto before = runtime->loompar->thread_manager().Find({thread.home_host, thread.local_tid});
-    auto status = runtime->loompar->JoinThread({thread.home_host, thread.local_tid});
-    if (retval) {
-        std::lock_guard<std::mutex> lock(runtime->result_mutex);
-        auto it = runtime->results.find(ThreadKey(thread));
-        if (it != runtime->results.end()) { *retval = *it->second; runtime->results.erase(it); }
-        else if (before.ok()) *retval = reinterpret_cast<void*>(static_cast<std::uintptr_t>(before.value().result_value));
-    }
+    std::uint64_t result = 0;
+    auto status = runtime->loompar->JoinThread({thread.home_host, thread.local_tid}, &result);
+    if (status.ok() && retval) *retval = reinterpret_cast<void*>(static_cast<std::uintptr_t>(result));
     return ToCStatus(status);
 }
 
 extern "C" cl_status_t cl_pthread_detach(cl_runtime_t* runtime, cl_pthread_t thread) {
     if (runtime == nullptr || runtime->loompar == nullptr) return CL_INVALID_ARGUMENT;
-    auto status = runtime->loompar->thread_manager().Detach({thread.home_host, thread.local_tid});
-    std::lock_guard<std::mutex> lock(runtime->result_mutex); runtime->results.erase(ThreadKey(thread));
-    return ToCStatus(status);
+    return ToCStatus(runtime->loompar->DetachThread({thread.home_host, thread.local_tid}));
 }
 
 extern "C" cl_status_t cl_pthread_migration_safe_point(cl_runtime_t* runtime) {
     if (runtime == nullptr || runtime->loompar == nullptr) return CL_INVALID_ARGUMENT;
-    const auto gtid = cxloom::loompar::ThreadManager::CurrentGtid();
-    return ToCStatus(runtime->loompar->thread_manager().MigrationSafePoint(gtid));
+    return ToCStatus(cxloom::loompar::ThreadManager::CurrentSafePoint());
 }
 
 extern "C" cl_status_t cl_pthread_mutex_init(cl_runtime_t* runtime, cl_pthread_mutex_t* mutex) {
@@ -195,51 +235,84 @@ extern "C" cl_status_t cl_pthread_mutex_init(cl_runtime_t* runtime, cl_pthread_m
         impl->object = object.value();
         impl->distributed = true;
     }
+    if (impl->distributed) {
+        auto status = cl_mem_write(runtime, {impl->object.region_id, impl->object.offset}, 0, &kMutexMagic, sizeof(kMutexMagic), 10000);
+        if (status != CL_OK) { runtime->loommem.FreeShared(impl->object); delete impl; return status; }
+    }
     mutex->impl = impl;
     return CL_OK;
 }
-extern "C" cl_status_t cl_pthread_mutex_lock(cl_pthread_mutex_t* mutex) {
+namespace {
+void CooperativePause() {
+    if (auto* fiber = cxloom::loompar::Fiber::Current()) {
+        auto state = std::make_shared<cxloom::loompar::Fiber::WaitState>();
+        state->deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1);
+        fiber->Park(std::move(state));
+    } else std::this_thread::sleep_for(std::chrono::milliseconds(1));
+}
+cl_status_t LockMutex(cl_pthread_mutex_t* mutex, bool attempt) {
     if (!mutex || !mutex->impl) return CL_INVALID_ARGUMENT;
     auto* impl = static_cast<ClMutex*>(mutex->impl);
+    std::unique_lock<std::mutex> lock(impl->guard);
+    const auto owner = cxloom::CurrentExecutionContextId();
+    if (impl->locked && impl->owner == owner) return attempt ? CL_UNAVAILABLE : CL_FAILED_PRECONDITION;
+    if (attempt && impl->locked) return CL_UNAVAILABLE;
+    ++impl->waiters;
+    impl->available.wait(lock, [&] { return !impl->locked; });
+    --impl->waiters;
+    impl->locked = true;
+    impl->owner = owner;
+    lock.unlock();
+    cl_status_t status = CL_OK;
     if (impl->distributed) {
-        if (impl->lease) return CL_FAILED_PRECONDITION;
-        auto result = impl->runtime->loommem.AcquireWriteBuffer(impl->object, 10000);
-        if (!result.ok()) return ToCStatus(result.status());
-        impl->lease = std::make_unique<cxloom::loommem::WriteBuffer>(std::move(result.value()));
-        return CL_OK;
+        for (;;) {
+            auto lease = impl->runtime->loommem.AcquireWriteBuffer(impl->object, attempt ? 1 : 10000);
+            if (lease.ok()) {
+                impl->lease = std::make_unique<cxloom::loommem::WriteBuffer>(std::move(lease.value()));
+                break;
+            }
+            status = ToCStatus(lease.status());
+            if (attempt || status != CL_UNAVAILABLE) break;
+            CooperativePause();
+        }
+        if (impl->lease) status = CL_OK;
     }
-    impl->value.lock(); return CL_OK;
-}
-extern "C" cl_status_t cl_pthread_mutex_trylock(cl_pthread_mutex_t* mutex) {
-    if (!mutex || !mutex->impl) return CL_INVALID_ARGUMENT;
-    auto* impl = static_cast<ClMutex*>(mutex->impl);
-    if (impl->distributed) {
-        if (impl->lease) return CL_UNAVAILABLE;
-        auto result = impl->runtime->loommem.AcquireWriteBuffer(impl->object, 1);
-        if (!result.ok()) return CL_UNAVAILABLE;
-        impl->lease = std::make_unique<cxloom::loommem::WriteBuffer>(std::move(result.value()));
-        return CL_OK;
+    if (status == CL_OK) status = ToCStatus(impl->runtime->loommem.SynchronizeAcquire());
+    if (status != CL_OK) {
+        if (impl->lease) { impl->runtime->loommem.ReleaseWriteBuffer(*impl->lease); impl->lease.reset(); }
+        lock.lock(); impl->locked = false; impl->owner = 0; impl->available.notify_one();
     }
-    return impl->value.try_lock() ? CL_OK : CL_UNAVAILABLE;
+    return status;
 }
+}
+extern "C" cl_status_t cl_pthread_mutex_lock(cl_pthread_mutex_t* mutex) { return LockMutex(mutex, false); }
+extern "C" cl_status_t cl_pthread_mutex_trylock(cl_pthread_mutex_t* mutex) { return LockMutex(mutex, true); }
 extern "C" cl_status_t cl_pthread_mutex_unlock(cl_pthread_mutex_t* mutex) {
     if (!mutex || !mutex->impl) return CL_INVALID_ARGUMENT;
     auto* impl = static_cast<ClMutex*>(mutex->impl);
+    std::lock_guard<std::mutex> lock(impl->guard);
+    if (!impl->locked || impl->owner != cxloom::CurrentExecutionContextId()) return CL_FAILED_PRECONDITION;
+    auto status = impl->runtime->loommem.SynchronizeRelease();
+    if (!status.ok()) return ToCStatus(status);
     if (impl->distributed) {
-        if (!impl->lease) return CL_FAILED_PRECONDITION;
-        auto status = impl->runtime->loommem.ReleaseWriteBuffer(*impl->lease);
-        if (status.ok()) impl->lease.reset();
-        return ToCStatus(status);
+        status = impl->runtime->loommem.ReleaseWriteBuffer(*impl->lease);
+        if (!status.ok()) return ToCStatus(status);
+        impl->lease.reset();
     }
-    impl->value.unlock(); return CL_OK;
+    impl->locked = false; impl->owner = 0;
+    impl->available.notify_one();
+    return CL_OK;
 }
 extern "C" cl_status_t cl_pthread_mutex_destroy(cl_pthread_mutex_t* mutex) {
     if (!mutex || !mutex->impl) return CL_INVALID_ARGUMENT;
     auto* impl = static_cast<ClMutex*>(mutex->impl);
-    if (impl->distributed) {
-        if (impl->lease) return CL_FAILED_PRECONDITION;
-        auto status = impl->runtime->loommem.FreeShared(impl->object);
-        if (!status.ok()) return ToCStatus(status);
+    {
+        std::lock_guard<std::mutex> lock(impl->guard);
+        if (impl->locked || impl->waiters) return CL_FAILED_PRECONDITION;
+        if (impl->distributed && impl->owns_object) {
+            auto status = impl->runtime->loommem.FreeShared(impl->object);
+            if (!status.ok()) return ToCStatus(status);
+        }
     }
     delete impl; mutex->impl = nullptr; return CL_OK;
 }
@@ -257,96 +330,169 @@ extern "C" cl_status_t cl_pthread_cond_init(cl_runtime_t* runtime, cl_pthread_co
         impl->object = object.value();
         impl->distributed = true;
     }
+    if (impl->distributed) {
+        const std::uint64_t zero[3] = {kConditionMagic, 0, 0};
+        auto status = cl_mem_write(runtime, {impl->object.region_id, impl->object.offset}, 0, zero, sizeof(zero), 10000);
+        if (status != CL_OK) { runtime->loommem.FreeShared(impl->object); delete impl; return status; }
+    }
     condition->impl = impl; return CL_OK;
 }
-extern "C" cl_status_t cl_pthread_cond_wait(cl_pthread_cond_t* condition, cl_pthread_mutex_t* mutex) {
+namespace {
+// A shared condition reserves one bit per active waiter. Signal selects one
+// registered waiter; broadcast selects the complete registered cohort.
+struct SharedCondition { std::uint64_t magic{kConditionMagic}; std::uint64_t waiting{0}; std::uint64_t ready{0}; };
+cl_status_t ChangeCondition(ClCond* cond, const std::function<cl_status_t(SharedCondition&)>& change) {
+    for (;;) {
+        auto buffer = cond->runtime->loommem.AcquireWriteBuffer(cond->object, 10000);
+        if (!buffer.ok()) {
+            if (buffer.status().code() != cxloom::StatusCode::kUnavailable) return ToCStatus(buffer.status());
+            CooperativePause(); continue;
+        }
+        auto* state = static_cast<SharedCondition*>(buffer.value().data());
+        auto result = change(*state);
+        auto released = cond->runtime->loommem.ReleaseWriteBuffer(buffer.value());
+        return released.ok() ? result : ToCStatus(released);
+    }
+}
+cl_status_t WaitCondition(cl_pthread_cond_t* condition, cl_pthread_mutex_t* mutex, uint64_t timeout_ms) {
     if (!condition || !condition->impl || !mutex || !mutex->impl) return CL_INVALID_ARGUMENT;
     auto* impl = static_cast<ClMutex*>(mutex->impl);
     auto* cond = static_cast<ClCond*>(condition->impl);
-    if (impl->distributed != cond->distributed) return CL_FAILED_PRECONDITION;
-    if (cond->distributed) {
-        std::uint64_t observed = 0;
-        if (cl_mem_read(cond->runtime, {cond->object.region_id, cond->object.offset}, 0,
-                        &observed, sizeof(observed), 10000) != CL_OK) return CL_UNAVAILABLE;
-        cond->waiters.fetch_add(1, std::memory_order_acq_rel);
-        if (cl_pthread_mutex_unlock(mutex) != CL_OK) { cond->waiters.fetch_sub(1); return CL_FAILED_PRECONDITION; }
-        for (;;) {
-            std::uint64_t current = observed;
-            auto status = cl_mem_read(cond->runtime, {cond->object.region_id, cond->object.offset}, 0,
-                                      &current, sizeof(current), 10000);
-            if (status != CL_OK) return status;
-            if (current != observed) break;
-            std::this_thread::yield();
-        }
-        auto result = cl_pthread_mutex_lock(mutex);
-        cond->waiters.fetch_sub(1, std::memory_order_acq_rel);
-        return result;
+    if (impl->runtime != cond->runtime) return CL_INVALID_ARGUMENT;
+    {
+        std::lock_guard<std::mutex> guard(impl->guard);
+        if (!impl->locked || impl->owner != cxloom::CurrentExecutionContextId()) return CL_FAILED_PRECONDITION;
     }
-    std::unique_lock<std::mutex> lock(impl->value, std::adopt_lock);
-    cond->waiters.fetch_add(1, std::memory_order_acq_rel);
-    static_cast<ClCond*>(condition->impl)->value.wait(lock); lock.release();
-    cond->waiters.fetch_sub(1, std::memory_order_acq_rel);
-    return CL_OK;
-}
-extern "C" cl_status_t cl_pthread_cond_timedwait(cl_pthread_cond_t* condition, cl_pthread_mutex_t* mutex,
-                                                  uint64_t timeout_ms) {
-    if (!condition || !condition->impl || !mutex || !mutex->impl || timeout_ms == 0) return CL_INVALID_ARGUMENT;
-    auto* impl = static_cast<ClMutex*>(mutex->impl);
-    auto* cond = static_cast<ClCond*>(condition->impl);
-    if (cond->waiters.load(std::memory_order_acquire) != 0) return CL_FAILED_PRECONDITION;
-    if (impl->distributed != cond->distributed) return CL_FAILED_PRECONDITION;
+    const auto deadline = timeout_ms ? std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms)
+                                    : std::chrono::steady_clock::time_point::max();
+    std::unique_lock<std::mutex> lock(cond->guard);
+    ++cond->waiters;
+    cl_status_t status = CL_OK;
+    std::uint64_t bit = 0;
     if (cond->distributed) {
-        std::uint64_t observed = 0;
-        if (cl_mem_read(cond->runtime, {cond->object.region_id, cond->object.offset}, 0,
-                        &observed, sizeof(observed), timeout_ms) != CL_OK) return CL_UNAVAILABLE;
-        if (cl_pthread_mutex_unlock(mutex) != CL_OK) return CL_FAILED_PRECONDITION;
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-        for (;;) {
-            std::uint64_t current = observed;
-            auto status = cl_mem_read(cond->runtime, {cond->object.region_id, cond->object.offset}, 0,
-                                      &current, sizeof(current), timeout_ms);
-            if (status == CL_OK && current != observed) {
-                auto result = cl_pthread_mutex_lock(mutex);
-                cond->waiters.fetch_sub(1, std::memory_order_acq_rel);
-                return result;
-            }
-            if (std::chrono::steady_clock::now() >= deadline) {
-                cl_pthread_mutex_lock(mutex);
-                cond->waiters.fetch_sub(1, std::memory_order_acq_rel);
-                return CL_UNAVAILABLE;
-            }
-            std::this_thread::yield();
-        }
+        lock.unlock();
+        status = ChangeCondition(cond, [&](SharedCondition& state) {
+            auto free = ~state.waiting;
+            if (!free) return CL_UNAVAILABLE;
+            bit = free & (~free + 1);
+            state.waiting |= bit;
+            state.ready &= ~bit;
+            return CL_OK;
+        });
+        lock.lock();
+        if (status != CL_OK) { --cond->waiters; return status; }
     }
-    std::unique_lock<std::mutex> lock(impl->value, std::adopt_lock);
-    cond->waiters.fetch_add(1, std::memory_order_acq_rel);
-    const auto ready = cond->value.wait_for(lock, std::chrono::milliseconds(timeout_ms));
-    lock.release();
-    cond->waiters.fetch_sub(1, std::memory_order_acq_rel);
-    return ready == std::cv_status::timeout ? CL_UNAVAILABLE : CL_OK;
+    status = cl_pthread_mutex_unlock(mutex);
+    if (status != CL_OK) {
+        if (bit) { lock.unlock(); ChangeCondition(cond, [&](SharedCondition& state) {
+            state.waiting &= ~bit; state.ready &= ~bit; return CL_OK;
+        }); lock.lock(); }
+        --cond->waiters; return status;
+    }
+    if (!cond->distributed) {
+        status = cond->value.wait_until(lock, deadline) == std::cv_status::timeout ? CL_UNAVAILABLE : CL_OK;
+    } else {
+        lock.unlock();
+        for (;;) {
+            auto acquired = cond->runtime->loommem.SynchronizeAcquire();
+            if (!acquired.ok()) { status = ToCStatus(acquired); break; }
+            SharedCondition state;
+            status = cl_mem_read(cond->runtime, {cond->object.region_id, cond->object.offset}, 0, &state, sizeof(state), 1);
+            if (status == CL_OK && (state.ready & bit)) break;
+            if (status != CL_OK && status != CL_UNAVAILABLE) break;
+            if (std::chrono::steady_clock::now() >= deadline) { status = CL_UNAVAILABLE; break; }
+            CooperativePause();
+        }
+        auto cleanup = ChangeCondition(cond, [&](SharedCondition& state) {
+            state.waiting &= ~bit; state.ready &= ~bit; return CL_OK;
+        });
+        if (cleanup != CL_OK) status = cleanup;
+        lock.lock();
+    }
+    // Keep the waiter registered until it has reacquired the application mutex.
+    lock.unlock();
+    auto reacquired = cl_pthread_mutex_lock(mutex);
+    lock.lock(); --cond->waiters;
+    return reacquired == CL_OK ? status : reacquired;
 }
-extern "C" cl_status_t cl_pthread_cond_signal(cl_pthread_cond_t* condition) {
+cl_status_t NotifyCondition(cl_pthread_cond_t* condition, bool all) {
     if (!condition || !condition->impl) return CL_INVALID_ARGUMENT;
     auto* cond = static_cast<ClCond*>(condition->impl);
-    if (cond->distributed) {
-        auto result = cond->runtime->loommem.AcquireWriteBuffer(cond->object, 10000);
-        if (!result.ok()) return ToCStatus(result.status());
-        auto* value = static_cast<std::uint64_t*>(result.value().data()); ++*value;
-        return ToCStatus(cond->runtime->loommem.ReleaseWriteBuffer(result.value()));
-    }
-    cond->value.notify_one(); return CL_OK;
+    if (cond->distributed) return ChangeCondition(cond, [&](SharedCondition& state) {
+        auto pending = state.waiting & ~state.ready;
+        state.ready |= all ? pending : pending & (~pending + 1);
+        return CL_OK;
+    });
+    std::lock_guard<std::mutex> lock(cond->guard);
+    if (all) cond->value.notify_all(); else cond->value.notify_one();
+    return CL_OK;
 }
-extern "C" cl_status_t cl_pthread_cond_broadcast(cl_pthread_cond_t* condition) {
-    return cl_pthread_cond_signal(condition);
 }
+extern "C" cl_status_t cl_pthread_cond_wait(cl_pthread_cond_t* condition, cl_pthread_mutex_t* mutex) {
+    return WaitCondition(condition, mutex, 0);
+}
+extern "C" cl_status_t cl_pthread_cond_timedwait(cl_pthread_cond_t* condition, cl_pthread_mutex_t* mutex, uint64_t timeout_ms) {
+    if (!timeout_ms) return CL_INVALID_ARGUMENT;
+    return WaitCondition(condition, mutex, timeout_ms);
+}
+extern "C" cl_status_t cl_pthread_cond_signal(cl_pthread_cond_t* condition) { return NotifyCondition(condition, false); }
+extern "C" cl_status_t cl_pthread_cond_broadcast(cl_pthread_cond_t* condition) { return NotifyCondition(condition, true); }
 extern "C" cl_status_t cl_pthread_cond_destroy(cl_pthread_cond_t* condition) {
     if (!condition || !condition->impl) return CL_INVALID_ARGUMENT;
     auto* cond = static_cast<ClCond*>(condition->impl);
-    if (cond->distributed) {
-        auto status = cond->runtime->loommem.FreeShared(cond->object);
-        if (!status.ok()) return ToCStatus(status);
+    {
+        std::lock_guard<std::mutex> lock(cond->guard);
+        if (cond->waiters) return CL_FAILED_PRECONDITION;
+        if (cond->distributed && cond->owns_object) {
+            auto status = cond->runtime->loommem.FreeShared(cond->object);
+            if (!status.ok()) return ToCStatus(status);
+        }
     }
     delete cond; condition->impl = nullptr; return CL_OK;
+}
+
+namespace {
+template<class Impl, class Handle>
+cl_status_t ExportSync(Handle* handle, cl_gptr_t* object) {
+    if (!handle || !handle->impl || !object) return CL_INVALID_ARGUMENT;
+    auto* impl = static_cast<Impl*>(handle->impl);
+    if (!impl->distributed) return CL_FAILED_PRECONDITION;
+    *object = {impl->object.region_id, impl->object.offset};
+    return CL_OK;
+}
+template<class Impl, class Handle>
+cl_status_t AttachSync(cl_runtime_t* runtime, Handle* handle, cl_gptr_t object, std::uint64_t magic) {
+    if (!runtime || !handle || runtime->config.host_count < 2) return CL_INVALID_ARGUMENT;
+    auto status = EnsurePar(runtime);
+    if (status != CL_OK) return status;
+    auto reference = runtime->loommem.AcquireObjectReference({object.region_id, object.offset});
+    if (!reference.ok()) return ToCStatus(reference.status());
+    auto read = runtime->loommem.AcquireReadSnapshot({object.region_id, object.offset}, 10000);
+    if (!read.ok()) return ToCStatus(read.status());
+    std::uint64_t observed = 0;
+    if (read.value().bytes() != 64) return CL_INVALID_ARGUMENT;
+    std::memcpy(&observed, read.value().data(), sizeof(observed));
+    if (observed != magic) return CL_INVALID_ARGUMENT;
+    auto* impl = new (std::nothrow) Impl();
+    if (!impl) return CL_UNAVAILABLE;
+    impl->runtime = runtime; impl->object = {object.region_id, object.offset};
+    impl->distributed = true; impl->owns_object = false;
+    impl->reference = std::move(reference.value());
+    handle->impl = impl;
+    return CL_OK;
+}
+}
+extern "C" cl_status_t cl_pthread_mutex_export(cl_pthread_mutex_t* mutex, cl_gptr_t* object) {
+    return ExportSync<ClMutex>(mutex, object);
+}
+extern "C" cl_status_t cl_pthread_mutex_attach(cl_runtime_t* runtime, cl_pthread_mutex_t* mutex, cl_gptr_t object) {
+    return AttachSync<ClMutex>(runtime, mutex, object, kMutexMagic);
+}
+extern "C" cl_status_t cl_pthread_cond_export(cl_pthread_cond_t* condition, cl_gptr_t* object) {
+    return ExportSync<ClCond>(condition, object);
+}
+extern "C" cl_status_t cl_pthread_cond_attach(cl_runtime_t* runtime, cl_pthread_cond_t* condition, cl_gptr_t object) {
+    return AttachSync<ClCond>(runtime, condition, object, kConditionMagic);
 }
 
 extern "C" cl_status_t cl_pthread_barrier_init(cl_runtime_t* runtime, cl_pthread_barrier_t* barrier,

@@ -635,6 +635,7 @@ Status TokenService::Release(const TokenLease& lease, bool modified) {
         const auto data_status = PublishData(region_base_ + lease.object.offset + block_offset, block_bytes, mode_);
         if (!data_status.ok())
             return data_status;
+        target.value().block->last_writer.store(local_host_, std::memory_order_release);
         target.value().block->version.fetch_add(1, std::memory_order_acq_rel);
     }
     if ((coherence_epoch & 1U) != 0)

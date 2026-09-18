@@ -2,6 +2,7 @@
 
 #include <ucontext.h>
 #include <cstdlib>
+#include "cxloom/common/execution_context.h"
 
 namespace cxloom::loompar {
 struct Fiber::Impl {
@@ -12,16 +13,15 @@ struct Fiber::Impl {
     Entry entry;
     Fiber* owner{nullptr};
     bool done{false};
+    std::uint64_t context_id{NewExecutionContextId()};
 };
 
 namespace {
 thread_local Fiber::Impl* current = nullptr;
 void Trampoline(std::uintptr_t raw) {
     auto* impl = reinterpret_cast<Fiber::Impl*>(raw);
-    current = impl;
     impl->entry();
     impl->done = true;
-    current = nullptr;
     setcontext(&impl->caller);
 }
 }
@@ -51,10 +51,29 @@ Status Fiber::TransferOwnership(std::uint32_t worker_id) {
 Status Fiber::Resume() {
     if (impl_->done) return Status::FailedPrecondition("fiber has completed");
     safe_point_ = false;
-    if (swapcontext(&impl_->caller, &impl_->context) != 0)
-        return Status::Internal("fiber context switch failed");
+    auto* previous = current;
+    const auto previous_context = active_execution_context;
+    const auto previous_park = park_execution;
+    current = impl_.get();
+    active_execution_context = impl_->context_id;
+    park_execution = [](std::shared_ptr<ExecutionWaitState> state) { Fiber::Current()->Park(std::move(state)); };
+    const auto switched = swapcontext(&impl_->caller, &impl_->context);
+    current = previous;
+    active_execution_context = previous_context;
+    park_execution = previous_park;
+    if (switched != 0) return Status::Internal("fiber context switch failed");
     done_ = impl_->done;
     return Status::Ok();
+}
+
+bool Fiber::runnable() const {
+    return !wait_ || wait_->ready.load() || std::chrono::steady_clock::now() >= wait_->deadline;
+}
+
+void Fiber::Park(std::shared_ptr<WaitState> state) {
+    wait_ = std::move(state);
+    Yield();
+    wait_.reset();
 }
 
 void Fiber::SafePoint() {

@@ -37,6 +37,14 @@ int main(void) {
     void *retval = NULL;
     status = cl_pthread_join(runtime, thread, &retval);
     if (status != CL_OK || calls != 1 || retval != NULL) { fprintf(stderr, "join=%d calls=%d\n", status, calls); return 1; }
+    cl_gptr_t object;
+    if (cl_mem_alloc(runtime, 64, 64, &object) != CL_OK) return 1;
+    cl_working_set_entry_t work = {object, 0, 64, CL_MEMORY_READ_WRITE, 1.0};
+    if (cl_pthread_create_with_working_set(runtime, &thread, worker, &value, sizeof(value), &work, 1) != CL_OK) return 1;
+    if (cl_pthread_join(runtime, thread, NULL) != CL_OK || calls != 2) return 1;
+    work.bytes = 65;
+    if (cl_pthread_create_with_working_set(runtime, &thread, worker, &value, sizeof(value), &work, 1) != CL_INVALID_ARGUMENT) return 1;
+    if (cl_mem_free(runtime, object) != CL_OK) return 1;
     cl_pthread_barrier_t barrier;
     if (cl_pthread_barrier_init(runtime, &barrier, 1) != CL_OK) return 1;
     if (cl_pthread_barrier_wait(&barrier) != CL_OK) return 1;

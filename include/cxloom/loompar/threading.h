@@ -15,6 +15,7 @@
 #include "cxloom/common/status.h"
 #include "cxloom/common/types.h"
 #include "cxloom/loompar/fiber.h"
+#include "cxloom/loompar/condition.h"
 
 namespace cxloom::loompar {
 
@@ -54,17 +55,21 @@ public:
     Status MarkRunning(const GlobalThreadId& gtid);
     Status MarkCompleted(const GlobalThreadId& gtid, std::int32_t exit_code, std::uint64_t result_value = 0);
     Status MarkJoined(const GlobalThreadId& gtid);
-    Status Join(const GlobalThreadId& gtid, std::function<Status()> acquire = {});
+    Status Join(const GlobalThreadId& gtid, std::function<Status()> acquire = {}, std::uint64_t* result = nullptr);
     Status Detach(const GlobalThreadId& gtid);
     Status Launch(const GlobalThreadId& gtid, ThreadFunction function,
                   std::function<Status()> acquire = {}, std::function<Status()> release = {},
                   std::function<std::uint64_t()> result = {},
-                  std::function<std::vector<std::byte>()> result_bytes = {});
+                  std::function<std::vector<std::byte>()> result_bytes = {},
+                  std::function<void()> on_complete = {});
     std::size_t size() const;
+    ExecutionLoad SampleExecutionLoad() const;
     Result<ThreadRecord> Find(const GlobalThreadId& gtid);
     Status MigrationSafePoint(const GlobalThreadId& gtid);
     Status RequestMigration(const GlobalThreadId& gtid, HostId target_host);
     static GlobalThreadId CurrentGtid();
+    static void SetCurrentResult(std::uint64_t value);
+    static Status CurrentSafePoint();
 
 private:
     HostId local_host_ {0};
@@ -72,7 +77,12 @@ private:
     struct Entry {
         ThreadRecord record;
         std::unique_ptr<Fiber> fiber;
-        std::condition_variable completed;
+        Condition completed;
+        bool detached{false};
+        int worker{-1};
+        std::int32_t exit_code{0};
+        std::uint64_t result{0};
+        std::function<void()> on_complete;
         bool joining {false};
         bool queued {false};
     };
@@ -82,7 +92,8 @@ private:
     std::condition_variable ready_cv_;
     std::vector<std::thread> workers_;
     bool stopping_{false};
-    void WorkerLoop();
+    std::uint32_t executing_{0};
+    void WorkerLoop(unsigned worker);
 };
 
 class FunctionRegistry {

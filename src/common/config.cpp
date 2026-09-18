@@ -5,6 +5,10 @@
 namespace cxloom {
 
 Status ConfigValidator::Validate(const CxloomConfig& config) {
+    if (config.placement_policy != PlacementPolicy::kMemoryAware &&
+        config.placement_policy != PlacementPolicy::kRoundRobin &&
+        config.placement_policy != PlacementPolicy::kLeastLoaded)
+        return Status::InvalidArgument("invalid placement policy");
     if (config.host_count == 0) {
         return Status::InvalidArgument("host_count must be greater than zero");
     }

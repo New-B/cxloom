@@ -1,4 +1,8 @@
-# Phase 8 evaluation — 2026-09-06
+# Phase 8 evaluation — historical record (2026-09-06)
+
+This file records the environment and simulation state from 2026-09-06. It is
+not the current implementation status; see `project-verification-20260906.md`
+and `cxloom-design-understanding.md` for the current contract.
 
 ## DAX acceptance attempt
 

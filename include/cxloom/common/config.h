@@ -9,6 +9,8 @@
 
 namespace cxloom {
 
+enum class PlacementPolicy { kMemoryAware = 0, kRoundRobin = 1, kLeastLoaded = 2 };
+
 struct CxloomConfig {
     HostId local_host_id {0};
     std::uint16_t host_count {1};
@@ -31,6 +33,7 @@ struct CxloomConfig {
     std::uint64_t bootstrap_timeout_ms {10000};
 
     std::uintptr_t cxl_base_hint {0};
+    PlacementPolicy placement_policy {PlacementPolicy::kMemoryAware};
     double scheduler_slack_ratio {0.25};
     // Zero means unlimited. Limits are enforced independently on each execution host.
     std::uint32_t max_running_threads_per_host {0};
